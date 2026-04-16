@@ -1,5 +1,6 @@
 sources = files(
-    'host_agent.c'
+    'host_agent.c',
+    'host_agent_config.c'
 )
 
 # DOCA 3.x split dependencies (control-path messaging to DPU)

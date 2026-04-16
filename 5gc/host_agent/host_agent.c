@@ -6,7 +6,7 @@
  * hugepage visibility for rte_malloc'd payloads.
  *
  * Lifecycle:
- *   1. Initialises as ONVM NF with SERVICE_ID = HOST_AGENT_SERVICE_ID (3)
+ *   1. Initialises as ONVM NF with SERVICE_ID = HOST_AGENT_SERVICE_ID (14)
  *   2. Opens DOCA Comch client connection to the DPU Agent
  *   3. Registers msg_handler callback for ONVM inter-NF messages
  *   4. On each message: validate, serialise, transmit via Comch, rte_free
@@ -38,6 +38,7 @@
 
 #include "upf_events.h"
 #include "hw_offload_msg.h"
+#include "host_agent_config.h"
 
 /* ── DOCA Comch client (control-path only) ──────────────────────────── */
 #include <doca_comch.h>
@@ -49,6 +50,9 @@
 DOCA_LOG_REGISTER(HOST_AGENT);
 
 #define NF_TAG "host_agent"
+#define DEFAULT_PCI_ADDR "03:00.0"
+#define DEFAULT_SERVER_NAME "dpu_agent"
+#define DEFAULT_HOST_AGENT_CONFIG_PATH "config/host_agent.yaml"
 
 /* ── Comch state ────────────────────────────────────────────────────── */
 static struct doca_dev          *comch_dev;
@@ -63,8 +67,15 @@ static uint64_t g_msgs_sent;
 static uint64_t g_msgs_failed;
 
 /* ── CLI options ────────────────────────────────────────────────────── */
-static char g_pci_addr[32] = "03:00.0";   /* BF3 PF on host (default)  */
-static char g_server_name[64] = "dpu_agent"; /* Comch server name       */
+static char g_pci_addr[32] = DEFAULT_PCI_ADDR;
+static char g_server_name[64] = DEFAULT_SERVER_NAME;
+
+struct host_agent_app_args {
+    const char *config_path;
+    const char *pci_addr_override;
+    const char *server_name_override;
+    bool config_path_explicit;
+};
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  DOCA Comch helpers
@@ -373,30 +384,49 @@ usage(const char *progname) {
     printf("Usage:\n");
     printf("  %s [EAL args] -- [NF_LIB args] -- [HOST_AGENT args]\n", progname);
     printf("\nHost Agent args:\n");
-    printf("  -d <PCI_ADDR>   BF3 PF PCI address (default: %s)\n", g_pci_addr);
-    printf("  -s <NAME>       Comch server name   (default: %s)\n", g_server_name);
+    printf("  -f <PATH>       YAML config path    (default: %s)\n",
+           DEFAULT_HOST_AGENT_CONFIG_PATH);
+    printf("  -d <PCI_ADDR>   BF3 PF PCI address override (default: %s)\n",
+           DEFAULT_PCI_ADDR);
+    printf("  -s <NAME>       Comch server name override   (default: %s)\n",
+           DEFAULT_SERVER_NAME);
 }
 
 static int
-parse_app_args(int argc, char *argv[], const char *progname) {
+parse_app_args(int argc, char *argv[], struct host_agent_app_args *app_args,
+               const char *progname) {
     int c;
-    while ((c = getopt(argc, argv, "d:s:h")) != -1) {
+
+    app_args->config_path = DEFAULT_HOST_AGENT_CONFIG_PATH;
+    app_args->pci_addr_override = NULL;
+    app_args->server_name_override = NULL;
+    app_args->config_path_explicit = false;
+
+    optind = 1;
+    opterr = 0;
+
+    while ((c = getopt(argc, argv, "f:d:s:h")) != -1) {
         switch (c) {
+            case 'f':
+                app_args->config_path = optarg;
+                app_args->config_path_explicit = true;
+                break;
             case 'd':
-                snprintf(g_pci_addr, sizeof(g_pci_addr), "%s", optarg);
+                app_args->pci_addr_override = optarg;
                 break;
             case 's':
-                snprintf(g_server_name, sizeof(g_server_name), "%s", optarg);
+                app_args->server_name_override = optarg;
                 break;
             case 'h':
                 usage(progname);
-                return -1;
+                return 1;
             default:
                 usage(progname);
                 return -1;
         }
     }
-    return optind;
+
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -406,7 +436,9 @@ int
 main(int argc, char *argv[]) {
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
+    struct host_agent_app_args app_args;
     int arg_offset;
+    int parse_rc;
     const char *progname = argv[0];
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
@@ -432,9 +464,37 @@ main(int argc, char *argv[]) {
     argc -= arg_offset;
     argv += arg_offset;
 
-    if (parse_app_args(argc, argv, progname) < 0) {
+    parse_rc = parse_app_args(argc, argv, &app_args, progname);
+    if (parse_rc > 0) {
+        onvm_nflib_stop(nf_local_ctx);
+        return 0;
+    }
+    if (parse_rc < 0) {
         onvm_nflib_stop(nf_local_ctx);
         rte_exit(EXIT_FAILURE, "Invalid command-line arguments\n");
+    }
+
+    if (HostAgent_LoadAndParseConfig(app_args.config_path,
+                                     g_pci_addr, sizeof(g_pci_addr),
+                                     g_server_name, sizeof(g_server_name)) != 0) {
+        if (app_args.config_path_explicit) {
+            onvm_nflib_stop(nf_local_ctx);
+            rte_exit(EXIT_FAILURE,
+                     "Failed to load/parse Host Agent YAML config.\n");
+        }
+        fprintf(stderr,
+                "[HOST_AGENT][CONFIG] using built-in defaults because the default config could not be loaded\n");
+    } else {
+        printf("Host Agent config loaded from %s\n", app_args.config_path);
+    }
+
+    if (app_args.pci_addr_override) {
+        snprintf(g_pci_addr, sizeof(g_pci_addr), "%s",
+                 app_args.pci_addr_override);
+    }
+    if (app_args.server_name_override) {
+        snprintf(g_server_name, sizeof(g_server_name), "%s",
+                 app_args.server_name_override);
     }
 
     /* Initialise DOCA Comch client to DPU */

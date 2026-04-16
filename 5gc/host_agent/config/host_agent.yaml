@@ -1,0 +1,7 @@
+info:
+  version: 1.0.0
+  description: Host Agent configuration
+
+configuration:
+  pci_addr: "07:00.0"
+  server_name: "dpu_agent"
