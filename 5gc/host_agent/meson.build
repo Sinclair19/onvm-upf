@@ -1,0 +1,10 @@
+sources = files(
+    'host_agent.c'
+)
+
+# DOCA 3.x split dependencies (control-path messaging to DPU)
+# These dependency objects are provided by the parent 5gc/meson.build.
+host_agent_link_deps = [
+  doca_common_dep,
+  doca_comch_dep,
+]

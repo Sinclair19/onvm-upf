@@ -45,6 +45,8 @@
 #include "../classifiers/classifier_wrapper.h"
 #include "../classifiers/upf_cls_adapter.h"
 
+#include "upf_hw_offload.h"
+
 
 // for logging
 /* #include <inttypes.h>
@@ -127,8 +129,7 @@ static inline void PdrFreeUpTo(uint32_t ack_ver) {
  *   - version odd  => writer in progress
  *   - version even => stable, usable
  * Returns the new even version. If retired_out != NULL, *retired_out gets
- * the previously active pointer. If retired_hash_out != NULL, it gets the
- * previously active hash bypass table.
+ * the previously active pointer.
  */
 static inline uint32_t upf_cls_publish(void *new_snap,
                                         void **retired_out) {
@@ -708,6 +709,12 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
         rte_free(upfPdr);
         return STATUS_ERROR;
     }
+
+    /* Proactively push the PDR to DPU silicon via Host Agent.
+     * Non-fatal: if the Host Agent is not running or the DPU is
+     * unavailable, the software fallback (UPF-U) handles the traffic. */
+    upf_build_and_send_hw_offload(upfPdr);
+
     return STATUS_OK;
 }
 
@@ -1225,6 +1232,20 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
         return STATUS_ERROR;
     }
 
+    /* ── HW offload: if this PDR is already offloaded, send UPDATE_PDR
+     *    to DPU so it can delete + re-insert with new match fields.
+     *    If the PDR is no longer offloadable (FAR changed to DROP/BUFF),
+     *    delete the stale HW rule instead. ──────────────────────────── */
+    if (upfPdr->hw_rule_id != 0) {
+        if (upfPdr->far &&
+            (upfPdr->far->applyAction & UPDK_FAR_APPLY_ACTION_FORW)) {
+            upf_send_hw_offload_update_pdr(upfPdr);
+        } else {
+            if (upf_send_hw_offload_delete(upfPdr->hw_rule_id) == 0)
+                upfPdr->hw_rule_id = 0;
+        }
+    }
+
     return STATUS_OK;
 }
 
@@ -1346,6 +1367,51 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
         (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW)) {
          UpfSendEvt1(UPF_U_SERVICE_ID, UPF_EVENT_CLEAR_AND_DRAIN,
                      (uintptr_t)session->index);
+    }
+
+    /* ── HW offload: notify DPU of FAR action change for every
+     *    offloaded PDR that references this FAR ID ──────────────── */
+    {
+        list_iterator_t *it = list_iterator_new(session->pdr_list, LIST_HEAD);
+        list_node_t *n;
+        while (it && (n = list_iterator_next(it))) {
+            UpfPDR *p = (UpfPDR *)n->val;
+            if (p && p->farId == farID) {
+                /* ── UL buffering omission ─────────────────────────────
+                 * If the previous FAR action was BUFF and this is a UL
+                 * PDR (sourceInterface == ACCESS), UPF-C never forwarded
+                 * the BUFF to the DPU (see upf_send_hw_offload_update_far).
+                 * Skip the BUFF→FORW UPDATE_FAR too: the DPU-side UL flow
+                 * was never put in BUFFER mode and remains on its fast
+                 * path.  Sending FORW would trigger a spurious drain
+                 * attempt on the DPU that fails and logs an error.
+                 * Note: BUFF→DROP is NOT skipped — DROP must still remove
+                 * the HW rule from the DPU.                              */
+                if ((oldAction & PFCP_FAR_APPLY_ACTION_BUFF) &&
+                    (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW) &&
+                    p->pdi.sourceInterface == UPDK_INTERFACE_VALUE_ACCESS) {
+                    UTLT_Debug("hw_offload: skip BUFF→FORW for UL PDR %u "
+                               "(DPU UL flow never buffered)", p->pdrId);
+                    continue;
+                }
+                if (p->hw_rule_id != 0) {
+                    int rc = upf_send_hw_offload_update_far(p, upfFar);
+                    /* DROP deletes the HW rule on DPU — clear hw_rule_id so
+                     * a later UpdateFAR(FORW) won't reference a stale rule.
+                     * Only clear on send success; if send fails, DPU still
+                     * has the rule and CP must keep the reference. */
+                    if (rc == 0 &&
+                        (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_DROP))
+                        p->hw_rule_id = 0;
+                } else if (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW) {
+                    /* DROP→FORW recovery: hw_rule_id was cleared by a prior
+                     * DROP.  Re-offload the PDR to restore HW acceleration.
+                     * Non-fatal: if re-offload fails, SW fallback handles it. */
+                    upf_build_and_send_hw_offload(p);
+                }
+            }
+        }
+        if (it) list_iterator_destroy(it);
     }
 
 #if HANDLE_BUFFER
@@ -1499,7 +1565,19 @@ Status UpfN4HandleUpdateQer(UpfSession *session, UpdateQER *updateQer) {
     UTLT_Assert(_ConvertUpdateQERTlvToRule(upfQer, updateQer) == STATUS_OK,
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
 
- 
+    /* ── HW offload: notify DPU of QER rate change for every
+     *    offloaded PDR that references this QER ─────────────────── */
+    {
+        list_iterator_t *it = list_iterator_new(session->pdr_list, LIST_HEAD);
+        list_node_t *n;
+        while (it && (n = list_iterator_next(it))) {
+            UpfPDR *p = (UpfPDR *)n->val;
+            if (p && p->hw_rule_id != 0 && p->qer == upfQer)
+                upf_send_hw_offload_update_qer(p);
+        }
+        if (it) list_iterator_destroy(it);
+    }
+
     return STATUS_OK;
 }
 
@@ -1526,6 +1604,12 @@ Status UpfN4HandleRemovePdr(UpfSession *session, uint16_t nPDRID) {
 
     UpfPDR *upfPdr = d.pdr;   /* pointer to the removed PDR */
 
+    /* ── HW offload: tell DPU to remove the rule before we free it ── */
+    if (upfPdr->hw_rule_id != 0) {
+        if (upf_send_hw_offload_delete(upfPdr->hw_rule_id) == 0)
+            upfPdr->hw_rule_id = 0;
+    }
+
     UpfPDRGlobalRemove(upfPdr);
  
     uint32_t new_ver;
@@ -1549,6 +1633,21 @@ Status UpfN4HandleRemoveFar(UpfSession *session, uint32_t nFARID) {
     UTLT_Assert(session, return STATUS_ERROR,
                 "session not found");
 
+    /* ── HW offload: if any offloaded PDR references this FAR,
+     *    delete its HW rule (PDR can no longer forward) ──────── */
+    {
+        list_iterator_t *it = list_iterator_new(session->pdr_list, LIST_HEAD);
+        list_node_t *n;
+        while (it && (n = list_iterator_next(it))) {
+            UpfPDR *p = (UpfPDR *)n->val;
+            if (p && p->hw_rule_id != 0 && p->farId == farID) {
+                if (upf_send_hw_offload_delete(p->hw_rule_id) == 0)
+                    p->hw_rule_id = 0;
+            }
+        }
+        if (it) list_iterator_destroy(it);
+    }
+
     // Deregister FAR to Session
     UTLT_Assert(UpfFARDeregisterToSessionByID(session, farID) == STATUS_OK,
                 return STATUS_ERROR, 
@@ -1564,6 +1663,27 @@ Status UpfN4HandleRemoveQer(UpfSession *session, uint32_t nQERID) {
                 "farId should not be 0");
     UTLT_Assert(session, return STATUS_ERROR,
                 "session not found");
+
+    /* ── HW offload: if any offloaded PDR uses this QER,
+     *    send a QER update with zero rates so the DPU drops
+     *    the meter (traffic becomes unmetered, not stale) ──── */
+    {
+        UpfQER *qer = UpfQERFindByID(session, qerID);
+        list_iterator_t *it = list_iterator_new(session->pdr_list, LIST_HEAD);
+        list_node_t *n;
+        while (it && (n = list_iterator_next(it))) {
+            UpfPDR *p = (UpfPDR *)n->val;
+            if (p && p->hw_rule_id != 0 && p->qer == qer) {
+                /* Clear qer pointer BEFORE sending the update so that
+                 * upf_send_hw_offload_update_qer() reads NULL rates
+                 * and sends zeros to the DPU → DPU detaches the meter.
+                 * This is intentional: zero rates = "unmetered". */
+                p->qer = NULL;
+                upf_send_hw_offload_update_qer(p);
+            }
+        }
+        if (it) list_iterator_destroy(it);
+    }
 
     // Deregister QER to Session
     UTLT_Assert(UpfQERDeregisterToSessionByID(session, qerID) == STATUS_OK,
@@ -1735,7 +1855,7 @@ Status UpfN4HandleSessionModificationRequest(UpfSession *session, PfcpXact *xact
             UTLT_Info("Update PDR [%d]", i);
             UTLT_Assert(request->updatePDR[i].pDRID.presence == 1, ,
                         "[PFCP] PdrId in updatePDR not presence!");
-            status = UpfN4HandleUpdatePdr(session, &request->updatePDR);
+            status = UpfN4HandleUpdatePdr(session, &request->updatePDR[i]);
             UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
                     "Modification: Update PDR[%d] error",i);
         }
