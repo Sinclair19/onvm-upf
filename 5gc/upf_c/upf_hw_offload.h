@@ -26,11 +26,104 @@
 #include "updk/rule_qer.h"
 
 #include "hw_offload_msg.h"
-#include "pdr_hash_bypass.h"   /* phb_parse_flow_description, phb_candidate_t */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ── SDF flow-description parser ── */
+
+typedef struct {
+    uint32_t ue_ip;         /* UE IP in host byte order (for "assigned") */
+    uint8_t  sdf_proto;     /* IP protocol (0 = any/"ip")               */
+    uint32_t sdf_src_ip;    /* source IP host order (0 = any)            */
+    uint32_t sdf_dst_ip;    /* dest IP host order (0 = any)              */
+    uint8_t  sdf_src_pref;  /* source prefix length (32 = exact)         */
+    uint8_t  sdf_dst_pref;  /* dest prefix length (32 = exact)           */
+    uint16_t sdf_src_port;  /* source port (0 = wildcard)                */
+    uint16_t sdf_dst_port;  /* dest port (0 = wildcard)                  */
+} sdf_parsed_t;
+
+static inline uint32_t
+sdf_parse_ip_prefix(const char *s, uint8_t *pref_out)
+{
+    char buf[32];
+    size_t len = strlen(s);
+    if (len >= sizeof(buf)) return 0;
+    memcpy(buf, s, len + 1);
+
+    char *slash = strchr(buf, '/');
+    if (slash) {
+        *slash = '\0';
+        int p = atoi(slash + 1);
+        *pref_out = (p > 0 && p <= 32) ? (uint8_t)p : 32;
+    } else {
+        *pref_out = 32;
+    }
+
+    struct in_addr a;
+    if (inet_pton(AF_INET, buf, &a) != 1) {
+        *pref_out = 0;
+        return 0;
+    }
+    return ntohl(a.s_addr);
+}
+
+/* Parse a 3GPP flow description (IPFilterRule per TS 29.212 / RFC 6733)
+ * into the SDF fields for the HW offload message.
+ *
+ * Format:  action dir proto from src [srcport] to dst [dstport]
+ * c->ue_ip must already be set before calling. */
+static inline void
+sdf_parse_flow_description(const char *fd, sdf_parsed_t *c)
+{
+    if (!fd || !*fd) return;
+
+    char buf[64];
+    size_t fdlen = strlen(fd);
+    if (fdlen >= sizeof(buf)) fdlen = sizeof(buf) - 1;
+    memcpy(buf, fd, fdlen);
+    buf[fdlen] = '\0';
+
+    char *saveptr = NULL;
+    char *tok;
+
+    tok = strtok_r(buf, " ", &saveptr); if (!tok) return;  /* action */
+    tok = strtok_r(NULL, " ", &saveptr); if (!tok) return; /* dir    */
+
+    tok = strtok_r(NULL, " ", &saveptr); if (!tok) return; /* proto  */
+    c->sdf_proto = (strcmp(tok, "ip") == 0) ? 0 : (uint8_t)atoi(tok);
+
+    tok = strtok_r(NULL, " ", &saveptr); if (!tok) return; /* "from" */
+
+    tok = strtok_r(NULL, " ", &saveptr); if (!tok) return; /* src    */
+    if (strcmp(tok, "any") == 0) {
+        c->sdf_src_ip = 0; c->sdf_src_pref = 0;
+    } else if (strcmp(tok, "assigned") == 0) {
+        c->sdf_src_ip = c->ue_ip; c->sdf_src_pref = c->ue_ip ? 32 : 0;
+    } else {
+        c->sdf_src_ip = sdf_parse_ip_prefix(tok, &c->sdf_src_pref);
+    }
+
+    tok = strtok_r(NULL, " ", &saveptr); if (!tok) return;
+    if (strcmp(tok, "to") != 0) {
+        c->sdf_src_port = (uint16_t)atoi(tok);
+        tok = strtok_r(NULL, " ", &saveptr); if (!tok) return; /* "to" */
+    }
+
+    tok = strtok_r(NULL, " ", &saveptr); if (!tok) return; /* dst    */
+    if (strcmp(tok, "any") == 0) {
+        c->sdf_dst_ip = 0; c->sdf_dst_pref = 0;
+    } else if (strcmp(tok, "assigned") == 0) {
+        c->sdf_dst_ip = c->ue_ip; c->sdf_dst_pref = c->ue_ip ? 32 : 0;
+    } else {
+        c->sdf_dst_ip = sdf_parse_ip_prefix(tok, &c->sdf_dst_pref);
+    }
+
+    tok = strtok_r(NULL, " ", &saveptr);
+    if (tok && tok[0] >= '0' && tok[0] <= '9')
+        c->sdf_dst_port = (uint16_t)atoi(tok);
+}
 
 /* ── hw_rule_id generator (atomic, 24-bit, wrapping) ────────────── */
 /*
@@ -122,14 +215,14 @@ upf_build_and_send_hw_offload(UPDK_PDR *pdr)
 
     /* ── Match: SDF 5-tuple ────────────────────────────────────────── */
     if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flags.fd) {
-        phb_candidate_t tmp;
+        sdf_parsed_t tmp;
         memset(&tmp, 0, sizeof(tmp));
 
         /* ue_ip must be set for "assigned" keyword resolution */
         if (pdr->pdi.flags.ueIpAddress && pdr->pdi.ueIpAddress.flags.v4)
             tmp.ue_ip = ntohl(pdr->pdi.ueIpAddress.ipv4.s_addr);
 
-        phb_parse_flow_description(pdr->pdi.sdfFilter.flowDescription, &tmp);
+        sdf_parse_flow_description(pdr->pdi.sdfFilter.flowDescription, &tmp);
 
         msg->has_sdf      = 1;
         msg->sdf_proto    = tmp.sdf_proto;
@@ -426,11 +519,11 @@ upf_send_hw_offload_update_pdr(UPDK_PDR *pdr)
 
     /* Match: SDF 5-tuple */
     if (pdr->pdi.flags.sdfFilter && pdr->pdi.sdfFilter.flags.fd) {
-        phb_candidate_t tmp;
+        sdf_parsed_t tmp;
         memset(&tmp, 0, sizeof(tmp));
         if (pdr->pdi.flags.ueIpAddress && pdr->pdi.ueIpAddress.flags.v4)
             tmp.ue_ip = ntohl(pdr->pdi.ueIpAddress.ipv4.s_addr);
-        phb_parse_flow_description(pdr->pdi.sdfFilter.flowDescription, &tmp);
+        sdf_parse_flow_description(pdr->pdi.sdfFilter.flowDescription, &tmp);
         msg->has_sdf      = 1;
         msg->sdf_proto    = tmp.sdf_proto;
         msg->sdf_src_ip   = tmp.sdf_src_ip;
