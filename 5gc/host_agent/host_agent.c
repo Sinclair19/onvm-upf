@@ -501,9 +501,11 @@ main(int argc, char *argv[]) {
     struct onvm_nf_local_ctx *nf_local_ctx;
     struct onvm_nf_function_table *nf_function_table;
     struct host_agent_app_args app_args;
+    struct doca_log_backend *sdk_log = NULL;
     int arg_offset;
     int parse_rc;
     const char *progname = argv[0];
+    doca_error_t result;
 
     nf_local_ctx = onvm_nflib_init_nf_local_ctx();
     onvm_nflib_start_signal_handler(nf_local_ctx, NULL);
@@ -559,6 +561,24 @@ main(int argc, char *argv[]) {
     if (app_args.server_name_override) {
         snprintf(g_server_name, sizeof(g_server_name), "%s",
                  app_args.server_name_override);
+    }
+
+    result = doca_log_backend_create_standard();
+    if (result != DOCA_SUCCESS) {
+        fprintf(stderr, "host_agent: failed to init DOCA log backend: %s\n",
+                doca_error_get_descr(result));
+    } else {
+        result = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
+        if (result != DOCA_SUCCESS) {
+            fprintf(stderr, "host_agent: failed to init DOCA SDK log backend: %s\n",
+                    doca_error_get_descr(result));
+        } else {
+            result = doca_log_backend_set_sdk_level(sdk_log, DOCA_LOG_LEVEL_WARNING);
+            if (result != DOCA_SUCCESS) {
+                fprintf(stderr, "host_agent: failed to set DOCA SDK log level: %s\n",
+                        doca_error_get_descr(result));
+            }
+        }
     }
 
     /* Initialise DOCA Comch client to DPU */
