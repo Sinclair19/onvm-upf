@@ -374,10 +374,10 @@ msg_handler(void *msg_data,
 
     __atomic_fetch_add(&g_msgs_received, 1, __ATOMIC_RELAXED);
 
-    DOCA_LOG_INFO("msg_handler: op=%u dir=%s pdr=%u hw_rule=%u teid=0x%x",
+    /* DOCA_LOG_INFO("msg_handler: op=%u dir=%s pdr=%u hw_rule=%u teid=0x%x",
                   msg->op,
                   msg->direction == HW_DIR_UPLINK ? "UL" : "DL",
-                  msg->pdr_id, msg->hw_rule_id, msg->teid);
+                  msg->pdr_id, msg->hw_rule_id, msg->teid); */
 
     /* Transmit over DOCA Comch to the DPU Agent via task-based send */
     if (comch_client && comch_connected && comch_conn) {
