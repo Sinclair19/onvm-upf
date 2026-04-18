@@ -356,7 +356,6 @@ int SortableRulesetPartitioner::ComputeMaxIntersectionRecursive(const std::vecto
 std::vector<SortableRuleset>  SortableRulesetPartitioner::MaximumIndepdenentSetPartitioning(const std::vector<Rule>& rules) {
 	std::vector<Rule> current_rules = rules;
 	std::vector<SortableRuleset> all_buckets;
-	int sum_rank = 0;
 	while (!current_rules.empty()) {
 		for (int i = 0; i < (int)current_rules.size(); i++) current_rules[i].id = i;
 		auto out = MaximumIndependentSetAllFields(current_rules);
@@ -435,7 +434,7 @@ std::pair<std::vector<SortableRulesetPartitioner::part>, int> SortableRulesetPar
 		if (lhs.b < rhs.b) {
 			return lhs.b < rhs.b;
 		}
-		return lhs.a < lhs.a;
+		return lhs.a < rhs.a;
 	});
 
 	std::vector<LightWeightedInterval> wi = Utilities::FastCreateUniqueInterval(rules_given_field);
