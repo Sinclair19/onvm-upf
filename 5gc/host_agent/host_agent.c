@@ -42,6 +42,8 @@
 
 /* ── DOCA Comch client (control-path only) ──────────────────────────── */
 #include <doca_comch.h>
+#include <doca_compat.h>  /* Must precede doca_ctx.h on some DOCA releases */
+#include <doca_ctx.h>
 #include <doca_dev.h>
 #include <doca_error.h>
 #include <doca_log.h>
@@ -53,6 +55,9 @@ DOCA_LOG_REGISTER(HOST_AGENT);
 #define DEFAULT_PCI_ADDR "03:00.0"
 #define DEFAULT_SERVER_NAME "dpu_agent"
 #define DEFAULT_HOST_AGENT_CONFIG_PATH "config/host_agent.yaml"
+#define COMCH_CONNECT_RETRIES 100
+#define COMCH_CONNECT_POLL_US 10000
+#define COMCH_SHUTDOWN_RETRIES 1000
 
 /* ── Comch state ────────────────────────────────────────────────────── */
 static struct doca_dev          *comch_dev;
@@ -77,6 +82,33 @@ struct host_agent_app_args {
     bool config_path_explicit;
 };
 
+static void comch_destroy(void);
+
+static void
+progress_engine_once(void)
+{
+    if (comch_pe != NULL)
+        doca_pe_progress(comch_pe);
+}
+
+static bool
+pci_addr_match(const char *a, const char *b)
+{
+    size_t len_a, len_b;
+
+    if (strcmp(a, b) == 0)
+        return true;
+
+    len_a = strlen(a);
+    len_b = strlen(b);
+    if (len_a > len_b)
+        return strcmp(a + (len_a - len_b), b) == 0;
+    if (len_b > len_a)
+        return strcmp(b + (len_b - len_a), a) == 0;
+
+    return false;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  DOCA Comch helpers
  * ═══════════════════════════════════════════════════════════════════════ */
@@ -97,8 +129,12 @@ comch_ctx_state_changed_cb(const union doca_data user_data,
         DOCA_LOG_INFO("Comch client connected to DPU Agent");
         /* Cache the connection handle */
         doca_error_t result = doca_comch_client_get_connection(comch_client, &comch_conn);
-        if (result == DOCA_SUCCESS)
+        if (result == DOCA_SUCCESS) {
             comch_connected = true;
+        } else {
+            DOCA_LOG_WARN("Comch RUNNING but connection handle fetch failed: %s",
+                          doca_error_get_descr(result));
+        }
     } else if (next_state == DOCA_CTX_STATE_IDLE) {
         DOCA_LOG_WARN("Comch client disconnected or idle");
         comch_connected = false;
@@ -164,7 +200,7 @@ open_doca_device_by_pci(const char *pci_addr, struct doca_dev **dev)
         result = doca_devinfo_get_pci_addr_str(dev_list[i], addr_buf);
         if (result != DOCA_SUCCESS)
             continue;
-        if (strcmp(addr_buf, pci_addr) == 0) {
+        if (pci_addr_match(addr_buf, pci_addr)) {
             result = doca_dev_open(dev_list[i], dev);
             doca_devinfo_destroy_list(dev_list);
             return result;
@@ -181,20 +217,21 @@ static int
 comch_init(void)
 {
     doca_error_t result;
+    struct doca_ctx *ctx;
 
     /* Open the BF3 PF device */
     result = open_doca_device_by_pci(g_pci_addr, &comch_dev);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Cannot open device %s: %s",
                      g_pci_addr, doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
     /* Create progress engine */
     result = doca_pe_create(&comch_pe);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create PE: %s", doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
     /* Create Comch client: (dev, server_name, &client) — no PE arg */
@@ -202,17 +239,17 @@ comch_init(void)
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create Comch client: %s",
                      doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
-    struct doca_ctx *ctx = doca_comch_client_as_ctx(comch_client);
+    ctx = doca_comch_client_as_ctx(comch_client);
 
     /* Connect PE to client context */
     result = doca_pe_connect_ctx(comch_pe, ctx);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to connect PE to client ctx: %s",
                      doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
     /* Track connection state via generic ctx state change callback */
@@ -220,7 +257,7 @@ comch_init(void)
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set state changed cb: %s",
                      doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
     /* Configure task-based send (required before ctx start) */
@@ -231,13 +268,17 @@ comch_init(void)
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set send task conf: %s",
                      doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
     /* Register recv event callback */
     result = doca_comch_client_event_msg_recv_register(comch_client,
                                                         comch_recv_cb);
-    if (result != DOCA_SUCCESS) return -1;
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to register recv event callback: %s",
+                     doca_error_get_descr(result));
+        goto error;
+    }
 
     /* Set max message size to accommodate hw_offload_msg_t */
     result = doca_comch_client_set_max_msg_size(comch_client,
@@ -245,7 +286,7 @@ comch_init(void)
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set max msg size: %s",
                      doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
     /* Start the client context (initiates connection handshake) */
@@ -253,13 +294,13 @@ comch_init(void)
     if (result != DOCA_SUCCESS && result != DOCA_ERROR_IN_PROGRESS) {
         DOCA_LOG_ERR("Failed to start Comch client: %s",
                      doca_error_get_descr(result));
-        return -1;
+        goto error;
     }
 
     /* Drive progress engine until connection is established */
-    for (int i = 0; i < 100 && !comch_connected; i++) {
-        doca_pe_progress(comch_pe);
-        usleep(10000);   /* 10 ms */
+    for (int i = 0; i < COMCH_CONNECT_RETRIES && !comch_connected; i++) {
+        progress_engine_once();
+        usleep(COMCH_CONNECT_POLL_US);
     }
 
     if (comch_connected)
@@ -269,13 +310,37 @@ comch_init(void)
         DOCA_LOG_WARN("Comch client not yet connected (will retry in background)");
 
     return 0;
+
+error:
+    comch_destroy();
+    return -1;
 }
 
 static void
 comch_destroy(void)
 {
+    comch_connected = false;
+    comch_conn = NULL;
+
     if (comch_client) {
-        doca_ctx_stop(doca_comch_client_as_ctx(comch_client));
+        struct doca_ctx *ctx = doca_comch_client_as_ctx(comch_client);
+        doca_error_t result = doca_ctx_stop(ctx);
+
+        if (result == DOCA_ERROR_IN_PROGRESS) {
+            enum doca_ctx_states state;
+
+            for (int i = 0; i < COMCH_SHUTDOWN_RETRIES; i++) {
+                result = doca_ctx_get_state(ctx, &state);
+                if (result != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
+                    break;
+                progress_engine_once();
+                usleep(1000);
+            }
+        } else if (result != DOCA_SUCCESS && result != DOCA_ERROR_BAD_STATE) {
+            DOCA_LOG_WARN("Failed to stop Comch client ctx cleanly: %s",
+                          doca_error_get_descr(result));
+        }
+
         doca_comch_client_destroy(comch_client);
         comch_client = NULL;
     }
@@ -372,8 +437,7 @@ static int
 callback_handler(__attribute__((unused)) struct onvm_nf_local_ctx *nf_local_ctx)
 {
     /* Drive DOCA Comch event loop (send completions, recv callbacks) */
-    if (comch_pe)
-        doca_pe_progress(comch_pe);
+    progress_engine_once();
 
     return 0;
 }

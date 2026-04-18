@@ -18,6 +18,7 @@ foreach nf : l25gc_nfs
     name = 'l25gc_' + nf
     sources = []
     includes = [include_directories(nf), onvm_includes]
+    c_args = []
 
     subdir(nf)
 
@@ -30,6 +31,7 @@ foreach nf : l25gc_nfs
 
     if nf == 'host_agent' and doca_common_dep.found() and doca_comch_dep.found()
         deps += host_agent_link_deps
+        c_args += host_agent_c_args
     elif nf == 'host_agent'
         # Skip host_agent if DOCA SDK is not available on this host
         warning('DOCA SDK not found — skipping host_agent build')
@@ -41,6 +43,7 @@ foreach nf : l25gc_nfs
         sources,
         include_directories: includes,
         dependencies: deps,
+        c_args: c_args,
         install: true,
         install_tag: 'onvm',
         install_dir: onvm_output_dir + '/nf/' + nf
