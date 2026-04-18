@@ -281,6 +281,11 @@ typedef struct {
 
     // TODO: Need to handle multiple DeactivatePredefinedRules, dynamic alloc?
     char     deactivatePredefinedRules[0x40];
+
+    /* HW offload: DPU-side rule ID assigned by upf_build_and_send_hw_offload().
+     * 0 = not offloaded.  Used by Update/Remove handlers to reference the
+     * existing DPU rule for update-in-place or deletion. */
+    uint32_t hw_rule_id;
 } UPDK_PDR;
 
 #endif /* __UPDK_RULE_PDR_H__ */
