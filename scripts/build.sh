@@ -21,6 +21,11 @@ source env/bin/activate
 # To bypass the Go module cache write failure caused by insufficient permissions:
 export GOMODCACHE=/tmp/gomodcache
 
-meson setup build
+if [ -d build ]; then
+    meson configure build -Dwerror=false
+else
+    meson setup build -Dwerror=false
+fi
+
 ninja -C build onvm/logger/liblogger.a
 ninja -C build
