@@ -28,14 +28,12 @@
 struct rte_ether_addr g_cn_ue_eth;
 struct rte_ether_addr g_cn_dn_eth;
 
-uint16_t g_access_port = 0;
-uint16_t g_core_port   = 0;
+uint16_t g_n3_port = 0;
+uint16_t g_n6_port   = 0;
 uint16_t g_sgi_port    = 0;
 
-uint32_t g_access_ip_be = 0;
-uint32_t g_core_ip_be   = 0;
-uint32_t g_an_peer_ip_be = 0;
-uint32_t g_dn_peer_ip_be = 0;
+uint32_t g_n3_ip_be = 0;
+uint32_t g_n6_ip_be   = 0;
 
 char g_log_level[16] = "warning";
 
@@ -131,11 +129,11 @@ do_parse(yaml_document_t *doc) {
     if (!dp || dp->type != YAML_MAPPING_NODE)
         return -1;
 
-    // upf_access_ip
+    // upf_n3_ip
     {
-        yaml_node_t *n = map_get(doc, dp, "upf_access_ip");
+        yaml_node_t *n = map_get(doc, dp, "upf_n3_ip");
         if (!n || n->type != YAML_SCALAR_NODE) {
-            fprintf(stderr, "[UPF-U][CONFIG] missing upf_access_ip\n");
+            fprintf(stderr, "[UPF-U][CONFIG] missing upf_n3_ip\n");
             return -1;
         }
         const unsigned char *p = n->data.scalar.value;
@@ -146,17 +144,17 @@ do_parse(yaml_document_t *doc) {
         memcpy(buf, p, len);
         buf[len] = '\0';
 
-        if (parse_ipv4_address(buf, &g_access_ip_be) != 0) {
-            fprintf(stderr, "[UPF-U][CONFIG] invalid upf_access_ip\n");
+        if (parse_ipv4_address(buf, &g_n3_ip_be) != 0) {
+            fprintf(stderr, "[UPF-U][CONFIG] invalid upf_n3_ip\n");
             return -1;
         }
     }
 
-    // upf_core_ip
+    // upf_n6_ip
     {
-        yaml_node_t *n = map_get(doc, dp, "upf_core_ip");
+        yaml_node_t *n = map_get(doc, dp, "upf_n6_ip");
         if (!n || n->type != YAML_SCALAR_NODE) {
-            fprintf(stderr, "[UPF-U][CONFIG] missing upf_core_ip\n");
+            fprintf(stderr, "[UPF-U][CONFIG] missing upf_n6_ip\n");
             return -1;
         }
         const unsigned char *p = n->data.scalar.value;
@@ -167,50 +165,8 @@ do_parse(yaml_document_t *doc) {
         memcpy(buf, p, len);
         buf[len] = '\0';
 
-        if (parse_ipv4_address(buf, &g_core_ip_be) != 0) {
-            fprintf(stderr, "[UPF-U][CONFIG] invalid upf_core_ip\n");
-            return -1;
-        }
-    }
-
-    // an_peer_ip
-    {
-        yaml_node_t *n = map_get(doc, dp, "an_peer_ip");
-        if (!n || n->type != YAML_SCALAR_NODE) {
-            fprintf(stderr, "[UPF-U][CONFIG] missing an_peer_ip\n");
-            return -1;
-        }
-        const unsigned char *p = n->data.scalar.value;
-        size_t len = n->data.scalar.length;
-
-        char buf[64];
-        if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-        memcpy(buf, p, len);
-        buf[len] = '\0';
-
-        if (parse_ipv4_address(buf, &g_an_peer_ip_be) != 0) {
-            fprintf(stderr, "[UPF-U][CONFIG] invalid an_peer_ip\n");
-            return -1;
-        }
-    }
-
-    // dn_peer_ip
-    {
-        yaml_node_t *n = map_get(doc, dp, "dn_peer_ip");
-        if (!n || n->type != YAML_SCALAR_NODE) {
-            fprintf(stderr, "[UPF-U][CONFIG] missing dn_peer_ip\n");
-            return -1;
-        }
-        const unsigned char *p = n->data.scalar.value;
-        size_t len = n->data.scalar.length;
-
-        char buf[64];
-        if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-        memcpy(buf, p, len);
-        buf[len] = '\0';
-
-        if (parse_ipv4_address(buf, &g_dn_peer_ip_be) != 0) {
-            fprintf(stderr, "[UPF-U][CONFIG] invalid dn_peer_ip\n");
+        if (parse_ipv4_address(buf, &g_n6_ip_be) != 0) {
+            fprintf(stderr, "[UPF-U][CONFIG] invalid upf_n6_ip\n");
             return -1;
         }
     }
@@ -222,23 +178,23 @@ do_parse(yaml_document_t *doc) {
             fprintf(stderr, "[UPF-U][CONFIG] missing dataplane.ports\n");
             return -1;
         }
-        // access
+        // N3 port
         {
-            yaml_node_t *n = map_get(doc, ports, "access");
+            yaml_node_t *n = map_get(doc, ports, "n3_port");
             const char *s = scalar_str(n);
-            if (!s) { fprintf(stderr, "[UPF-U][CONFIG] missing ports.access\n"); return -1; }
+            if (!s) { fprintf(stderr, "[UPF-U][CONFIG] missing ports.n3_port\n"); return -1; }
             int v = atoi(s);
-            if (v < 0 || v > 255) { fprintf(stderr, "[UPF-U][CONFIG] bad ports.access\n"); return -1; }
-            g_access_port = (uint16_t)v;
+            if (v < 0 || v > 255) { fprintf(stderr, "[UPF-U][CONFIG] bad ports.n3_port\n"); return -1; }
+            g_n3_port = (uint16_t)v;
         }
-        // core  (SGi follows CORE)
+        // N6 port (SGi follows N6)
         {
-            yaml_node_t *n = map_get(doc, ports, "core");
+            yaml_node_t *n = map_get(doc, ports, "n6_port");
             const char *s = scalar_str(n);
-            if (!s) { fprintf(stderr, "[UPF-U][CONFIG] missing ports.core\n"); return -1; }
+            if (!s) { fprintf(stderr, "[UPF-U][CONFIG] missing ports.n6_port\n"); return -1; }
             int v = atoi(s);
-            if (v < 0 || v > 255) { fprintf(stderr, "[UPF-U][CONFIG] bad ports.core\n"); return -1; }
-            g_core_port = (uint16_t)v;
+            if (v < 0 || v > 255) { fprintf(stderr, "[UPF-U][CONFIG] bad ports.n6_port\n"); return -1; }
+            g_n6_port = (uint16_t)v;
             g_sgi_port  = (uint16_t)v;
         }
     }
@@ -284,17 +240,17 @@ void
 init_l2_addrs(void) {
     int ret;
 
-    ret = rte_eth_macaddr_get(g_access_port, &g_cn_ue_eth);
+    ret = rte_eth_macaddr_get(g_n3_port, &g_cn_ue_eth);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE,
                  "Cannot get MAC address: err=%d, port=%" PRIu16 "\n",
-                 ret, g_access_port);
+                 ret, g_n3_port);
     }
 
-    ret = rte_eth_macaddr_get(g_core_port, &g_cn_dn_eth);
+    ret = rte_eth_macaddr_get(g_n6_port, &g_cn_dn_eth);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE,
                  "Cannot get MAC address: err=%d, port=%" PRIu16 "\n",
-                 ret, g_core_port);
+                 ret, g_n6_port);
     }
 }

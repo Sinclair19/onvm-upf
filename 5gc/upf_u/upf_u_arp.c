@@ -43,8 +43,8 @@ static struct rte_mempool *g_pktmbuf_pool = NULL;
 /* Check if the given IP is one of our local IPs on the specified port */
 static int
 is_local_ip_on_port(uint16_t port, uint32_t ip_be) {
-    if (port == g_access_port) return g_access_ip_be == ip_be;
-    if (port == g_core_port)   return g_core_ip_be == ip_be;
+    if (port == g_n3_port) return g_n3_ip_be == ip_be;
+    if (port == g_n6_port)   return g_n6_ip_be == ip_be;
     return 0;
 }
 

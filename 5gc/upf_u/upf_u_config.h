@@ -22,15 +22,12 @@
 #include <stdint.h>
 #include <rte_ether.h>
 
-extern uint32_t g_access_ip_be;   // UPF local IP on the access-facing port
-extern uint32_t g_core_ip_be;     // UPF local IP on the core/SGi-facing port
+extern uint32_t g_n3_ip_be;     // UPF local IP on the access-facing port
+extern uint32_t g_n6_ip_be;     // UPF local IP on the core/SGi-facing port
 
-extern uint32_t g_an_peer_ip_be;  // Next-hop IP of the AN/gNB peer
-extern uint32_t g_dn_peer_ip_be;  // Next-hop IP of the DN/upstream router peer
-
-extern uint16_t  g_access_port;    // UPF-U DPDK port connected to the access side (AN/gNB)
-extern uint16_t  g_core_port;      // UPF-U DPDK port connected to the core side (SGi)
-extern uint16_t  g_sgi_port;       // UPF-U DPDK port connected to the SGi side
+extern uint16_t  g_n3_port;      // UPF-U DPDK port connected to the access side (AN/gNB)
+extern uint16_t  g_n6_port;      // UPF-U DPDK port connected to the core side (SGi)
+extern uint16_t  g_sgi_port;     // UPF-U DPDK port connected to the SGi side
 
 extern struct rte_ether_addr g_cn_ue_eth;  // Ethernet address for access-facing side of UPF (used when sending to UE)
 extern struct rte_ether_addr g_cn_dn_eth;  // Ethernet address for core-facing side of UPF (used when sending to DN)
