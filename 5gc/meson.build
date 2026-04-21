@@ -2,6 +2,7 @@ subdir('classifiers')
 
 
 l25gc_nfs = [
+    'upf_lb',
     'upf_u',
     'upf_c',
     'dn_app'
@@ -21,6 +22,10 @@ foreach nf : l25gc_nfs
 
     if nf == 'upf_u'
         deps += upf_u_link_deps
+    endif
+
+    if nf == 'upf_lb'
+        deps += upf_lb_link_deps
     endif
 
     executable(

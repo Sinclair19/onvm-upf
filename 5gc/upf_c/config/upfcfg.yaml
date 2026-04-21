@@ -25,6 +25,10 @@ configuration:
     core: 1
     sgi: 1
 
+  upf_u_workers:
+    - 3
+    - 4
+
   dnn_list:
     - dnn: internet
       cidr: 10.60.0.0/24

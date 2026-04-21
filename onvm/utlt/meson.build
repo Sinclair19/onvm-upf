@@ -2,6 +2,7 @@ utlt_sources = files(
   'utlt_3gppTypes.c',
   'utlt_debug.c',
   'utlt_event.c',
+  'upf_events.c',
   'utlt_lib.c',
   'utlt_sockAddr.c',
   'utlt_test.c',
@@ -18,7 +19,7 @@ utlt_sources = files(
   'utlt_unix_sock.c'
 )
 
-utlt_includes = include_directories('.', '../logger')
+utlt_includes = include_directories('.', '../logger', '../onvm_nflib')
 
 libm_dep = cc.find_library('m')
 

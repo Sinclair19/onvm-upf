@@ -368,9 +368,11 @@ UpfSession *UpfSessionAlloc(const uint64_t seid) {
     }
     UpfSession *session;
     session = UpfGetSessionByIndex(status);
+    memset(session, 0, sizeof(*session));
     session->index = status;
     session->hashKey = cal_hash;
     session->upfSeid = seid;
+    session->worker_service_id = UPF_INVALID_SERVICE_ID;
     // UTLT_Debug("UpfSessionAlloc: dump");
     // DumpUpfSession();
     // UTLT_Debug("UpfSessionAlloc: dump done");
@@ -389,6 +391,44 @@ UpfSession *UpfSessionFindByUeIP(uint32_t ue_ip) {
         return NULL;
     }
     return UpfGetSessionByIndex(status);
+}
+
+uint16_t
+UpfSessionGetWorkerServiceId(const UpfSession *session) {
+    if (!session) {
+        return UPF_INVALID_SERVICE_ID;
+    }
+
+    return session->worker_service_id;
+}
+
+Status
+UpfSessionSetWorkerServiceId(UpfSession *session, uint16_t worker_service_id) {
+    if (!session || worker_service_id == UPF_INVALID_SERVICE_ID) {
+        return STATUS_ERROR;
+    }
+
+    session->worker_service_id = worker_service_id;
+    return STATUS_OK;
+}
+
+uint16_t
+UpfSessionEnsureWorkerServiceId(UpfSession *session, uint32_t teid) {
+    if (!session) {
+        return UPF_INVALID_SERVICE_ID;
+    }
+
+    if (session->worker_service_id != UPF_INVALID_SERVICE_ID) {
+        return session->worker_service_id;
+    }
+
+    uint16_t worker_service_id = UpfSelectWorkerServiceIdByTeid(teid);
+    if (worker_service_id == UPF_INVALID_SERVICE_ID) {
+        return UPF_INVALID_SERVICE_ID;
+    }
+
+    session->worker_service_id = worker_service_id;
+    return worker_service_id;
 }
 
 Status InsertUEIPtoSessionMap(const uint32_t ue_ip, UpfSession *session) {

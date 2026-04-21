@@ -361,6 +361,7 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     session->srr_flag = false;
 
     session->teid = rte_cpu_to_be_32(teid->teid);
+    session->worker_service_id = UpfSelectWorkerServiceIdByTeid(teid->teid);
     session->pdn.paa.pdnType = pdnType;
     if (pdnType == PFCP_PDN_TYPE_IPV4) {
         session->ueIpv4.addr4.s_addr = rte_cpu_to_be_32(ueIp->addr4.s_addr);

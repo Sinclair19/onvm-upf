@@ -22,6 +22,7 @@
 #include "utlt_debug.h"
 #include "utlt_buff.h"
 #include "upf_context.h"
+#include "upf_events.h"
 #include "pfcp_message.h"
 
 #ifdef __cplusplus
@@ -45,18 +46,6 @@ Status UpfN4BuildAssociationReleaseResponse(
         Bufblk **bufBlkPtr, uint8_t type);
 Status UpfN4BuildHeartbeatResponse (
         Bufblk **bufBlkPtr, uint8_t type);
-
-
-static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
-    Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
-    if (!e) return -1;
-    e->type = (uintptr_t)type;
-    e->argc = 1;
-    e->arg0 = a0;
-    int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
-    if (rc < 0) rte_free(e);
-    return rc;
-}
 
 #ifdef __cplusplus
 }

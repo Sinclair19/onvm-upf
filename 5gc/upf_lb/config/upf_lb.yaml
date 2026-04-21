@@ -1,0 +1,14 @@
+info:
+  version: 1.0.0
+  description: L25GC+ UPF-LB Configuration
+
+configuration:
+  log_level: "info"
+  service_id: 1
+
+  dataplane:
+    upf_access_ip: "192.168.1.2"
+
+  upf_u_workers:
+    - 3
+    - 4

@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 
+#include "onvm_nflib.h"
+#include "upf_events.h"
 #include "utlt_buff.h"
 #include "utlt_timer.h"
 
@@ -92,7 +94,7 @@ void EventTimerExpire(uintptr_t data, uintptr_t param[]) {
     msg->arg4 = param[5];
     
 
-    onvm_ret = onvm_nflib_send_msg_to_nf(2, msg);
+    onvm_ret = onvm_nflib_send_msg_to_nf(UPF_C_SERVICE_ID, msg);
     status = (onvm_ret == 0) ? STATUS_OK : STATUS_ERROR;
 
     //status = EventSend(queue, event.type, 5, event.arg0, event.arg1, event.arg2, event.arg3, event.arg4);

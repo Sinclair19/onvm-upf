@@ -27,6 +27,7 @@
 #include "updk/rule_qer.h"
 
 #include "list.h"
+#include "upf_events.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -138,6 +139,7 @@ typedef struct _UpfSession {
     UpfUeIp         ueIpv4;
     UpfUeIp         ueIpv6;
     uint32_t        teid;
+    uint16_t        worker_service_id;
 
     /* User location */
     Tai             tai;
@@ -213,6 +215,9 @@ void UeIpToUpfSessionMapFree(uint32_t ueip);
 UpfSession *UpfSessionFindBySeid(uint64_t seid);
 UpfSession *UpfSessionFindByTeid(uint32_t teid);
 UpfSession *UpfSessionFindByUeIP(uint32_t ueip);
+uint16_t UpfSessionGetWorkerServiceId(const UpfSession *session);
+Status UpfSessionSetWorkerServiceId(UpfSession *session, uint16_t worker_service_id);
+uint16_t UpfSessionEnsureWorkerServiceId(UpfSession *session, uint32_t teid);
 
 Status UpfPDRRegisterToSession(UpfSession *session, UpfPDR *pdr);
 Status UpfFARRegisterToSession(UpfSession *session, UpfFAR *far);

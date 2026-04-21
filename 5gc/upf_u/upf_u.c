@@ -65,18 +65,6 @@
 #define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
 #define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
 
-
-static inline int UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
-    Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
-    if (!e) return -1;
-    e->type = (uintptr_t)type;
-    e->argc = 1;
-    e->arg0 = a0;
-    int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
-    if (rc < 0) rte_free(e);
-    return rc;
-}
-
 enum { IF_UNKNOWN = -1 };
 
 struct rte_meter_trtcm_profile app_trtcm_profile;
@@ -115,7 +103,7 @@ static upf_cls_local_t g_cls_local = {0};
 
 // Flip to the latest published snapshot (called at burst boundary)
 static inline void
-UpfClsMaybeFlipAndAck(void) {
+UpfClsMaybeFlipAndAck(struct onvm_nf_local_ctx *nf_local_ctx) {
     if (likely(!g_cls_local.flip_pending))
         return;
 
@@ -152,7 +140,10 @@ UpfClsMaybeFlipAndAck(void) {
     g_cls_local.ver  = v2;
     g_cls_local.flip_pending = 0;
 
-    (void)UpfSendEvt1(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK, (uintptr_t)v2);
+    uint16_t self_service_id =
+        (nf_local_ctx && nf_local_ctx->nf) ? nf_local_ctx->nf->service_id : UPF_INVALID_SERVICE_ID;
+    (void)UpfSendEvt2(UPF_C_SERVICE_ID, EVT_CLS_GC_ACK,
+                      (uintptr_t)v2, (uintptr_t)self_service_id);
 }
 
 
@@ -874,7 +865,7 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer,
             msg->pdrId = pdrId;
             */
             UTLT_Debug("Send to upf-c, namely service id is 2\n");
-            onvm_nflib_send_msg_to_nf(2, msg);
+            onvm_nflib_send_msg_to_nf(UPF_C_SERVICE_ID, msg);
         }
         if (far->applyAction & UPDK_FAR_APPLY_ACTION_DUPL) {
             UTLT_Error("Duplicate Apply action: %u not supported, dropping the packet", far->applyAction);
@@ -921,6 +912,30 @@ drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
     return total;
 }
 
+static inline int
+redirect_to_owner_if_needed(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
+                            struct onvm_nf_local_ctx *nf_local_ctx,
+                            UpfSession *session, uint32_t teid) {
+    if (!session || !nf_local_ctx || !nf_local_ctx->nf) {
+        return 0;
+    }
+
+    uint16_t owner_service_id = UpfSessionEnsureWorkerServiceId(session, teid);
+    if (owner_service_id == UPF_INVALID_SERVICE_ID) {
+        return 0;
+    }
+
+    if (owner_service_id == nf_local_ctx->nf->service_id) {
+        return 0;
+    }
+
+    meta->action = ONVM_NF_ACTION_TONF;
+    meta->destination = owner_service_id;
+    UTLT_Debug("Redirecting packet for session %d from worker %u to owner %u",
+               session->index, nf_local_ctx->nf->service_id, owner_service_id);
+    return 1;
+}
+
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (pkt == NULL || meta == NULL) {
@@ -956,11 +971,12 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     }
 
     // Flip to a newly published snapshot if a REQ was received
-    UpfClsMaybeFlipAndAck();
+    UpfClsMaybeFlipAndAck(nf_local_ctx);
 
     UPDK_PDR *pdr = NULL;
     gtp_parse_result_t gtp_info = {0};
     int ue_idx = -1;
+    UpfSession *owner_session = NULL;
 
     /* char *src_address = convertToIpAddressString(iph->src_addr);
     UTLT_Info("Src IP is %s\n", src_address);
@@ -978,10 +994,20 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         if (parse_gtpu_once(pkt, &gtp_info) < 0 || !gtp_info.valid) {
             return 0;
         }
+
+        owner_session = UpfSessionFindByTeid(rte_cpu_to_be_32(gtp_info.teid));
+        if (redirect_to_owner_if_needed(pkt, meta, nf_local_ctx, owner_session, gtp_info.teid)) {
+            return 0;
+        }
         pdr = GetPdrByTeid(pkt, &gtp_info);
 
     } else {
         // UTLT_Info("It is downlink, dst is %s\n", convertToIpAddressString(iph->dst_addr));
+        owner_session = UpfSessionFindByUeIP(iph->dst_addr);
+        if (redirect_to_owner_if_needed(pkt, meta, nf_local_ctx, owner_session,
+                                        owner_session ? rte_be_to_cpu_32(owner_session->teid) : 0)) {
+            return 0;
+        }
         pdr = GetPdrByUeIpAddress(pkt, rte_cpu_to_be_32(iph->dst_addr));
         is_dl = true;
     }
@@ -1156,7 +1182,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             msg->arg0 = seid;
             msg->arg1 = pdrId;
             UTLT_Debug("Send to upf-c, namely service id is 2\n");
-            onvm_nflib_send_msg_to_nf(2, msg);
+            onvm_nflib_send_msg_to_nf(UPF_C_SERVICE_ID, msg);
         } 
         return 0;
     } else {

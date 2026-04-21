@@ -19,6 +19,7 @@
 #include "n4_onvm_pfcp_path.h"
 
 #include <errno.h>
+#include <rte_malloc.h>
 #include "utlt_buff.h"
 #include "utlt_debug.h"
 #include "pfcp_path.h"
@@ -38,7 +39,7 @@
   (RTE_ETHER_HDR_LEN + 20 + sizeof(struct rte_udp_hdr))
 
 // UpfClsOnAckFree is defined in n4_onvm_pfcp_handler.c
-extern void UpfClsOnAckFree(uint32_t ver);
+extern void UpfClsOnAckFree(uint32_t ver, uint16_t worker_service_id);
 
 void
 msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
@@ -53,8 +54,9 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
 
         case EVT_CLS_GC_ACK: {
             uint32_t ver = (uint32_t)msg->arg0;
-            UpfClsOnAckFree(ver);    /* frees retired snapshot if version matches */
-            //rte_free(msg);           /* receiver frees Event on success */
+            uint16_t worker_service_id = (uint16_t)msg->arg1;
+            UpfClsOnAckFree(ver, worker_service_id);
+            rte_free(msg);
             return;
         }
         default:
@@ -77,6 +79,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     //event.arg1 = msg->pdrId;
 
     UpfDispatcher(&event);
+    rte_free(msg);
 
 }
 

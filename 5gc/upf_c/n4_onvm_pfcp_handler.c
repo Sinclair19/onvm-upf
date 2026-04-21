@@ -21,6 +21,7 @@
 #include <endian.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <string.h>
 
 #include <rte_memory.h>
 
@@ -60,6 +61,10 @@ static pdr_retire_t *g_pdr_retire = NULL;
 static uint32_t      g_pdr_retire_len = 0;
 static uint32_t      g_pdr_retire_cap = 0;
 static uint32_t      g_pdr_head       = 0;
+static uint32_t      g_cls_ack_version = 0;
+static uint16_t      g_cls_ack_expected = 0;
+static uint16_t      g_cls_ack_received = 0;
+static uint16_t      g_cls_ack_sids[UPF_MAX_WORKERS];
 
 static inline void PdrRetireQEnsure(uint32_t need_extra) {
     uint32_t need = g_pdr_retire_len + need_extra;
@@ -150,6 +155,34 @@ static inline uint32_t upf_cls_publish(void *new_snap,
 
 static void *g_cls_retired_snapshot = NULL;
 static uint32_t g_cls_retired_version = 0;
+
+static void
+UpfClsAckTrackerReset(uint32_t ver, uint16_t expected) {
+    g_cls_ack_version = ver;
+    g_cls_ack_expected = expected;
+    g_cls_ack_received = 0;
+    memset(g_cls_ack_sids, 0, sizeof(g_cls_ack_sids));
+}
+
+static bool
+UpfClsAckTrackerMark(uint32_t ver, uint16_t worker_service_id) {
+    if (ver != g_cls_ack_version || worker_service_id == UPF_INVALID_SERVICE_ID) {
+        return false;
+    }
+
+    for (uint16_t i = 0; i < g_cls_ack_received; i++) {
+        if (g_cls_ack_sids[i] == worker_service_id) {
+            return false;
+        }
+    }
+
+    if (g_cls_ack_received >= UPF_MAX_WORKERS) {
+        return false;
+    }
+
+    g_cls_ack_sids[g_cls_ack_received++] = worker_service_id;
+    return g_cls_ack_received >= g_cls_ack_expected;
+}
 
 
 // bool UpfClsRebuildAndPublish(uint32_t *out_version) {
@@ -321,8 +354,15 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
         UTLT_Debug("CLS publish: new=%p retired=<none> ver=%u", snap, ver);
     }
 
-    /* Notify DP exactly once to flip to this version */
-    UpfSendEvt1(UPF_U_SERVICE_ID, EVT_CLS_GC_REQ, (uintptr_t)ver);
+    /* Notify every configured worker to flip to this version */
+    uint16_t fanout = UpfBroadcastEvt1ToWorkers(EVT_CLS_GC_REQ, (uintptr_t)ver);
+    UpfClsAckTrackerReset(ver, fanout);
+
+    if (retired && fanout == 0) {
+        cls_destroy((cls_handle_t *)retired);
+        __atomic_store_n(&g_cls_retired_snapshot, NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_cls_retired_version, 0, __ATOMIC_RELEASE);
+    }
 
     if (out_version) *out_version = ver;
     return true;
@@ -341,10 +381,11 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
     }
 } */
 
-void UpfClsOnAckFree(uint32_t ver) {
+void UpfClsOnAckFree(uint32_t ver, uint16_t worker_service_id) {
     // Acquire load so we compare against a coherent value
     uint32_t rver = __atomic_load_n(&g_cls_retired_version, __ATOMIC_ACQUIRE);
     if (ver != rver) return;
+    if (g_cls_ack_expected > 0 && !UpfClsAckTrackerMark(ver, worker_service_id)) return;
 
     // Atomic exchange to NULL to make it double-free proof
     void *to_free = __atomic_exchange_n(&g_cls_retired_snapshot, NULL, __ATOMIC_ACQ_REL);
@@ -355,6 +396,9 @@ void UpfClsOnAckFree(uint32_t ver) {
 
     // Optional: clear version (release) so duplicate ACKs are cheap no-ops
     __atomic_store_n(&g_cls_retired_version, 0, __ATOMIC_RELEASE);
+    g_cls_ack_version = 0;
+    g_cls_ack_expected = 0;
+    g_cls_ack_received = 0;
     PdrFreeUpTo(ver);
 }
 
@@ -1333,10 +1377,6 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
 
     //to check the last action
     oldAction = upfFar->applyAction;
-    if (oldAction & PFCP_FAR_APPLY_ACTION_BUFF) {
-         onvm_nflib_send_msg_to_nf(1, NULL);
-    }
-
     UTLT_Assert(_ConvertUpdateFARTlvToRule(upfFar, updateFar) == STATUS_OK,
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
 
@@ -1344,8 +1384,15 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
      * UPF-U sees the new FORW action when it processes drained packets. */
     if ((oldAction & PFCP_FAR_APPLY_ACTION_BUFF) &&
         (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW)) {
-         UpfSendEvt1(UPF_U_SERVICE_ID, UPF_EVENT_CLEAR_AND_DRAIN,
-                     (uintptr_t)session->index);
+         uint16_t worker_service_id =
+             UpfSessionEnsureWorkerServiceId(session, rte_be_to_cpu_32(session->teid));
+         if (worker_service_id != UPF_INVALID_SERVICE_ID) {
+             UpfSendEvt1(worker_service_id, UPF_EVENT_CLEAR_AND_DRAIN,
+                         (uintptr_t)session->index);
+         } else {
+             UTLT_Warning("Skipping CLEAR_AND_DRAIN for session %d without worker owner",
+                          session->index);
+         }
     }
 
 #if HANDLE_BUFFER

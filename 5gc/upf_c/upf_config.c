@@ -27,6 +27,7 @@
 static int SetProtocolIter(YamlIter *protoList, YamlIter *protoIter);
 // static Status ReadAddrList(YamlIter *protoIter, const char **hostname, int *num);
 static void DeleteYamlDocument();
+static Status ParseUpfWorkerServices(YamlIter *workerIter);
 
 static Status AddGtpv1Endpoint(const char *host); // host: hostname or ip address
 static Status AddPfcpEndpoint(const char *host); // host: hostname or ip address
@@ -188,6 +189,9 @@ Status UpfConfigParse() {
                     }
                     UTLT_Info("Dataplane ports: access=%d core=%d sgi=%d",
                              Self()->accessPort, Self()->corePort, Self()->sgiPort);
+                } else if (!strcmp(upfKey, "upf_u_workers")) {
+                    UTLT_Assert(ParseUpfWorkerServices(&upfIter) == STATUS_OK,
+                                return STATUS_ERROR, "Failed to parse upf_u_workers");
 
                 } else if (!strcmp(upfKey, "dnn_list")) {
                     YamlIter dnnList, dnnIter;
@@ -252,6 +256,9 @@ Status UpfConfigParse() {
     }
 
     DeleteYamlDocument();
+
+    UTLT_Assert(UpfWorkerCount() > 0, return STATUS_ERROR,
+                "No upf_u_workers configured");
     
     return STATUS_OK;
 }
@@ -271,6 +278,39 @@ static int SetProtocolIter(YamlIter *protoList, YamlIter *protoIter) {
     }
 
     return 0;
+}
+
+static Status ParseUpfWorkerServices(YamlIter *workerIter) {
+    uint16_t worker_ids[UPF_MAX_WORKERS];
+    uint16_t worker_count = 0;
+    YamlIter childIter;
+
+    YamlIterChild(workerIter, &childIter);
+
+    if (YamlIterType(&childIter) == YAML_SCALAR_NODE) {
+        const char *value = YamlIterGet(&childIter, GET_VALUE);
+        UTLT_Assert(value, return STATUS_ERROR, "Missing worker service id");
+        worker_ids[worker_count++] = (uint16_t)atoi(value);
+    } else {
+        do {
+            if (YamlIterType(&childIter) == YAML_SEQUENCE_NODE) {
+                if (!YamlIterNext(&childIter)) {
+                    break;
+                }
+            }
+
+            const char *value = YamlIterGet(&childIter, GET_VALUE);
+            UTLT_Assert(value, return STATUS_ERROR, "Missing worker service id");
+            UTLT_Assert(worker_count < UPF_MAX_WORKERS, return STATUS_ERROR,
+                        "Too many upf_u_workers entries");
+            worker_ids[worker_count++] = (uint16_t)atoi(value);
+        } while (YamlIterType(&childIter) == YAML_SEQUENCE_NODE);
+    }
+
+    UTLT_Assert(worker_count > 0, return STATUS_ERROR, "Empty upf_u_workers list");
+    UTLT_Assert(UpfWorkerConfigSet(worker_ids, worker_count) == 0,
+                return STATUS_ERROR, "Invalid upf_u_workers configuration");
+    return STATUS_OK;
 }
 
 /* static Status ReadAddrList(YamlIter *protoIter, const char **hostname, int *num) {
