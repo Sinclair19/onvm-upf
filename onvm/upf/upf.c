@@ -13,6 +13,7 @@
 #include <rte_malloc.h>
 #include <rte_memory.h>
 #include <rte_memzone.h>
+#include <rte_byteorder.h>
 
 #include "upf_context.h"
 
@@ -29,6 +30,7 @@
 #define UEIP_TO_HASH_KEY(x) (DEFAULT_HASH_FUNC(&x, sizeof(uint32_t), 0))
 
 #define NO_FLAGS 0
+#define UPF_SESSION_HASH_FLAGS RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY
 #define MAX_NUM_OF_USERS 1024
 #define MZ_TEID_TO_UPF_SESSION_MAP_INFO  "MProc_TeidToUpfSessionMap_info"
 #define MZ_UE_IP_TO_UPF_SESSION_MAP_INFO "MProc_UeIpToUpfSessionMap_info"
@@ -62,32 +64,41 @@ UeIpToUpfSessionMap *ueip_upf_session_map = NULL;
 
 UpfSessionPool *upf_session_table = NULL;
 
+static inline void *
+UpfSessionIndexToHashData(int index) {
+    return (void *)(uintptr_t)(index + 1);
+}
+
+static inline int
+UpfSessionIndexFromHashData(void *data) {
+    return (int)((uintptr_t)data - 1);
+}
+
 TeidToUpfSessionMap *teid_upf_session_map_create(void);
 
 TeidToUpfSessionMap *teid_upf_session_map_create(void) {
     struct rte_hash *hash = NULL;
-    struct rte_hash_parameters *hash_params;
+    struct rte_hash_parameters hash_params = {0};
     TeidToUpfSessionMap *ft;
 
-    hash_params = (struct rte_hash_parameters *)rte_malloc(
-            NULL, sizeof(struct rte_hash_parameters), 0);
-    if (!hash_params) {
+    char *name = rte_malloc(NULL, 64, 0);
+    if (!name) {
         return NULL;
     }
-
-    char *name = rte_malloc(NULL, 64, 0);
-    hash_params->entries = MAX_NUM_OF_USERS;
-    hash_params->key_len = sizeof(uint32_t);
-    hash_params->hash_func = rte_jhash;
-    hash_params->hash_func_init_val = 0;
-    hash_params->name = name;
-    hash_params->socket_id = rte_socket_id();
+    hash_params.entries = MAX_NUM_OF_USERS;
+    hash_params.key_len = sizeof(uint32_t);
+    hash_params.hash_func = rte_jhash;
+    hash_params.hash_func_init_val = 0;
+    hash_params.name = name;
+    hash_params.socket_id = rte_socket_id();
+    hash_params.extra_flag = UPF_SESSION_HASH_FLAGS;
 
     snprintf(name, 64, "teid_upf_session_map_%d-%" PRIu64, rte_lcore_id(),
             rte_get_tsc_cycles());
 
-    hash = rte_hash_create(hash_params);
+    hash = rte_hash_create(&hash_params);
     if (!hash) {
+        rte_free(name);
         return NULL;
     }
 
@@ -95,6 +106,7 @@ TeidToUpfSessionMap *teid_upf_session_map_create(void) {
             sizeof(TeidToUpfSessionMap), 0);
     if (!ft) {
         rte_hash_free(hash);
+        rte_free(name);
         return NULL;
     }
 
@@ -105,9 +117,11 @@ TeidToUpfSessionMap *teid_upf_session_map_create(void) {
     ft->data = rte_calloc("teid_upf_session_map_entry", MAX_NUM_OF_USERS, sizeof(int), 0);
     if (!ft->data) {
         rte_hash_free(hash);
+        rte_free(name);
         rte_free(ft);
         return NULL;
     }
+    rte_free(name);
     return ft;
 }
 
@@ -115,28 +129,27 @@ UeIpToUpfSessionMap *ueip_upf_session_map_create(void);
 
 UeIpToUpfSessionMap *ueip_upf_session_map_create(void) {
     struct rte_hash *hash = NULL;
-    struct rte_hash_parameters *hash_params;
+    struct rte_hash_parameters hash_params = {0};
     UeIpToUpfSessionMap *ft;
 
-    hash_params = (struct rte_hash_parameters *)rte_malloc(
-            NULL, sizeof(struct rte_hash_parameters), 0);
-    if (!hash_params) {
+    char *name = rte_malloc(NULL, 64, 0);
+    if (!name) {
         return NULL;
     }
-
-    char *name = rte_malloc(NULL, 64, 0);
-    hash_params->entries = MAX_NUM_OF_USERS;
-    hash_params->key_len = sizeof(uint32_t);
-    hash_params->hash_func = rte_jhash;
-    hash_params->hash_func_init_val = 0;
-    hash_params->name = name;
-    hash_params->socket_id = rte_socket_id();
+    hash_params.entries = MAX_NUM_OF_USERS;
+    hash_params.key_len = sizeof(uint32_t);
+    hash_params.hash_func = rte_jhash;
+    hash_params.hash_func_init_val = 0;
+    hash_params.name = name;
+    hash_params.socket_id = rte_socket_id();
+    hash_params.extra_flag = UPF_SESSION_HASH_FLAGS;
 
     snprintf(name, 64, "ueip_upf_session_map_%d-%" PRIu64, rte_lcore_id(),
             rte_get_tsc_cycles());
 
-    hash = rte_hash_create(hash_params);
+    hash = rte_hash_create(&hash_params);
     if (!hash) {
+        rte_free(name);
         return NULL;
     }
 
@@ -144,6 +157,7 @@ UeIpToUpfSessionMap *ueip_upf_session_map_create(void) {
             sizeof(UeIpToUpfSessionMap), 0);
     if (!ft) {
         rte_hash_free(hash);
+        rte_free(name);
         return NULL;
     }
 
@@ -154,9 +168,11 @@ UeIpToUpfSessionMap *ueip_upf_session_map_create(void) {
     ft->data = rte_calloc("ueip_upf_session_map_entry", MAX_NUM_OF_USERS, sizeof(int), 0);
     if (!ft->data) {
         rte_hash_free(hash);
+        rte_free(name);
         rte_free(ft);
         return NULL;
     }
+    rte_free(name);
     return ft;
 }
 
@@ -164,37 +180,37 @@ UpfSessionPool *upf_session_table_create(int cnt, int entry_size);
 
 UpfSessionPool *upf_session_table_create(int cnt, int entry_size) {
     struct rte_hash *hash = NULL;
-    struct rte_hash_parameters *hash_params;
+    struct rte_hash_parameters hash_params = {0};
     UpfSessionPool *ft;
 
-    hash_params = (struct rte_hash_parameters *)rte_malloc(
-            NULL, sizeof(struct rte_hash_parameters), 0);
-    if (!hash_params) {
+    char *name = rte_malloc(NULL, 64, 0);
+    if (!name) {
         return NULL;
     }
-
-    char *name = rte_malloc(NULL, 64, 0);
-    hash_params->entries = cnt;
-    hash_params->key_len = sizeof(uint64_t);
-    hash_params->hash_func = rte_jhash;
-    hash_params->hash_func_init_val = 0;
-    hash_params->name = name;
-    hash_params->socket_id = rte_socket_id();
+    hash_params.entries = cnt;
+    hash_params.key_len = sizeof(uint64_t);
+    hash_params.hash_func = rte_jhash;
+    hash_params.hash_func_init_val = 0;
+    hash_params.name = name;
+    hash_params.socket_id = rte_socket_id();
+    hash_params.extra_flag = UPF_SESSION_HASH_FLAGS;
 
     snprintf(name, 64, "upf_session_%d-%" PRIu64, rte_lcore_id(),
             rte_get_tsc_cycles());
 
     if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
-        hash = rte_hash_create(hash_params);
+        hash = rte_hash_create(&hash_params);
     }
 
     if (!hash) {
+        rte_free(name);
         return NULL;
     }
     ft = (UpfSessionPool *)rte_calloc("upf_session_table", 1,
             sizeof(UpfSessionPool), 0);
     if (!ft) {
         rte_hash_free(hash);
+        rte_free(name);
         return NULL;
     }
 
@@ -205,9 +221,11 @@ UpfSessionPool *upf_session_table_create(int cnt, int entry_size) {
     ft->data = rte_calloc("upf_session_table_entry", cnt, entry_size, 0);
     if (!ft->data) {
         rte_hash_free(hash);
+        rte_free(name);
         rte_free(ft);
         return NULL;
     }
+    rte_free(name);
     return ft;
 }
 
@@ -383,14 +401,19 @@ UpfSession *UpfSessionFindByUeIP(uint32_t ue_ip) {
     // UTLT_Debug("UpfSessionFindByUeIP");
     // DumpUpfSession();
     uint32_t cal_hash = UEIP_TO_HASH_KEY(ue_ip);
-    int32_t status = rte_hash_lookup_with_hash(ueip_upf_session_map->hash,
-                                               (const void *)&ue_ip,
-                                               cal_hash);
+    void *data = NULL;
+    int32_t status = rte_hash_lookup_with_hash_data(ueip_upf_session_map->hash,
+                                                    (const void *)&ue_ip,
+                                                    cal_hash, &data);
     if (status < 0) {
         UTLT_Info("Not Found UpfSessionFindByUeIP[%u]", ue_ip);
         return NULL;
     }
-    return UpfGetSessionByIndex(status);
+    if (!data) {
+        UTLT_Error("UE IP Mapping has no session index data");
+        return NULL;
+    }
+    return UpfGetSessionByIndex(UpfSessionIndexFromHashData(data));
 }
 
 uint16_t
@@ -433,9 +456,10 @@ UpfSessionEnsureWorkerServiceId(UpfSession *session, uint32_t teid) {
 
 Status InsertUEIPtoSessionMap(const uint32_t ue_ip, UpfSession *session) {
     uint32_t cal_hash = UEIP_TO_HASH_KEY(ue_ip);
-    int32_t status = rte_hash_lookup_with_hash(ueip_upf_session_map->hash,
-                                               (const void *)&ue_ip,
-                                               cal_hash);
+    void *data = NULL;
+    int32_t status = rte_hash_lookup_with_hash_data(ueip_upf_session_map->hash,
+                                                    (const void *)&ue_ip,
+                                                    cal_hash, &data);
     if (status >= 0) {
         UTLT_Error("UE IP Mapping already exists");
         return STATUS_ERROR;
@@ -443,39 +467,50 @@ Status InsertUEIPtoSessionMap(const uint32_t ue_ip, UpfSession *session) {
     status = rte_hash_add_key_with_hash_data(ueip_upf_session_map->hash,
                                              (const void *) &ue_ip,
                                              cal_hash,
-                                             &session->index);
+                                             UpfSessionIndexToHashData(session->index));
     return status == 0? STATUS_OK : STATUS_ERROR;
 }
 
 UpfSession *UpfSessionFindByTeid(uint32_t teid) {
     uint32_t cal_hash = TEID_TO_HASH_KEY(teid);
-    int32_t status = rte_hash_lookup_with_hash(teid_upf_session_map->hash,
-                                               (const void *)&teid,
-                                               cal_hash);
+    void *data = NULL;
+    int32_t status = rte_hash_lookup_with_hash_data(teid_upf_session_map->hash,
+                                                    (const void *)&teid,
+                                                    cal_hash, &data);
     if (status < 0) {
         UTLT_Info("Not Found InsertTEIDtoSessionMap[%u]", teid);
         return NULL;
     }
-    return UpfGetSessionByIndex(status);
+    if (!data) {
+        UTLT_Error("TEID Mapping has no session index data");
+        return NULL;
+    }
+    return UpfGetSessionByIndex(UpfSessionIndexFromHashData(data));
+}
+
+UpfSession *
+UpfSessionFindByTeidHost(uint32_t teid_host) {
+    return UpfSessionFindByTeid(rte_cpu_to_be_32(teid_host));
 }
 
 Status InsertTEIDtoSessionMap(const uint32_t teid, UpfSession *session) {
     uint32_t cal_hash = TEID_TO_HASH_KEY(teid);
-    int32_t status = rte_hash_lookup_with_hash(teid_upf_session_map->hash,
-                                               (const void *)&teid,
-                                               cal_hash);
+    void *data = NULL;
+    int32_t status = rte_hash_lookup_with_hash_data(teid_upf_session_map->hash,
+                                                    (const void *)&teid,
+                                                    cal_hash, &data);
     if (status >= 0) {
         return STATUS_ERROR;
     }
     status = rte_hash_add_key_with_hash_data(teid_upf_session_map->hash,
                                              (const void *) &teid,
                                              cal_hash,
-                                             &session->index);
+                                             UpfSessionIndexToHashData(session->index));
     return status == 0? STATUS_OK : STATUS_ERROR;
 }
 
 void UeIpToUpfSessionMapFree(const uint32_t ueip) {
-    uint32_t cal_hash = TEID_TO_HASH_KEY(ueip);
+    uint32_t cal_hash = UEIP_TO_HASH_KEY(ueip);
     int32_t status = rte_hash_del_key_with_hash(ueip_upf_session_map->hash,
                                                 (const void *)&ueip,
                                                 cal_hash);
@@ -494,6 +529,53 @@ void TeidToUpfSessionMapFree(const uint32_t teid) {
     }
 }
 
+Status
+UpfSessionUpdateTeid(UpfSession *session, uint32_t teid) {
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+
+    if (session->teid == teid) {
+        return STATUS_OK;
+    }
+
+    uint32_t old_teid = session->teid;
+    if (InsertTEIDtoSessionMap(teid, session) != STATUS_OK) {
+        UTLT_Error("Unable to add updated TEID mapping (%u)", teid);
+        return STATUS_ERROR;
+    }
+
+    session->teid = teid;
+    if (old_teid != 0) {
+        TeidToUpfSessionMapFree(old_teid);
+    }
+    return STATUS_OK;
+}
+
+Status
+UpfSessionUpdateTeidHost(UpfSession *session, uint32_t teid_host) {
+    return UpfSessionUpdateTeid(session, rte_cpu_to_be_32(teid_host));
+}
+
+Status
+UpfSessionUpdateUeIP(UpfSession *session, uint32_t ue_ip) {
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+
+    if (session->ueIpv4.addr4.s_addr == ue_ip) {
+        return STATUS_OK;
+    }
+
+    uint32_t old_ue_ip = session->ueIpv4.addr4.s_addr;
+    if (InsertUEIPtoSessionMap(ue_ip, session) != STATUS_OK) {
+        UTLT_Error("Unable to add updated UE IP mapping (%u)", ue_ip);
+        return STATUS_ERROR;
+    }
+
+    session->ueIpv4.addr4.s_addr = ue_ip;
+    if (old_ue_ip != 0) {
+        UeIpToUpfSessionMapFree(old_ue_ip);
+    }
+    return STATUS_OK;
+}
+
 void DumpUpfSession() {
     const void *next_key;
     void *next_data;
@@ -503,13 +585,13 @@ void DumpUpfSession() {
     printf("[DumpUpfSession]:\n");
     while (rte_hash_iterate(ueip_upf_session_map->hash, &next_key, &next_data, &iter) >= 0){
         uint32_t *key = (uint32_t *) next_key;
-        int32_t *index = (int32_t *) next_data;
-        session = UpfGetSessionByIndex(*index);
+        int index = UpfSessionIndexFromHashData(next_data);
+        session = UpfGetSessionByIndex(index);
 
         printf("Key (UE_IP):\n");
         printf("\t%d\n", *key);
         printf("Value:\n");
-        printf("\tIndex: %d\n", *index);
+        printf("\tIndex: %d\n", index);
         printf("\tSession: %p\tSize: %ld (0x%lx)\n", session, sizeof(UpfSession), sizeof(UpfSession));
         printf("\tTEID: %d\n", session->teid);
         printf("\tupfSeid: %ld\n", session->upfSeid);

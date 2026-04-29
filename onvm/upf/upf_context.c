@@ -392,12 +392,16 @@ Status UpfSessionRemove(UpfSession *session) {
         UpfSessBufRingDestroy(session->index);
     }
 
-    if (!session->far_list) {
+    if (session->far_list) {
         list_destroy(session->far_list);
     }
 
-    if (!session->pdr_list) {
+    if (session->pdr_list) {
         list_destroy(session->pdr_list);
+    }
+
+    if (session->qer_list) {
+        list_destroy(session->qer_list);
     }
     UeIpToUpfSessionMapFree(session->ueIpv4.addr4.s_addr);
     TeidToUpfSessionMapFree(session->teid);

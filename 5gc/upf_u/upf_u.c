@@ -1001,7 +1001,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             return 0;
         }
 
-        owner_session = UpfSessionFindByTeid(rte_cpu_to_be_32(gtp_info.teid));
+        owner_session = UpfSessionFindByTeidHost(gtp_info.teid);
         if (redirect_to_owner_if_needed(pkt, meta, nf_local_ctx, owner_session, gtp_info.teid)) {
             return 0;
         }

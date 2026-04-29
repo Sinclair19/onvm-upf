@@ -184,6 +184,31 @@ UpfClsAckTrackerMark(uint32_t ver, uint16_t worker_service_id) {
     return g_cls_ack_received >= g_cls_ack_expected;
 }
 
+static Status
+UpfN4SyncSessionPacketKeysFromPdi(UpfSession *session, const PDI *pdi) {
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+    if (!pdi || !pdi->presence) {
+        return STATUS_OK;
+    }
+
+    if (pdi->localFTEID.presence) {
+        PfcpFTeid *fTeid = (PfcpFTeid *)pdi->localFTEID.value;
+        UTLT_Assert(UpfSessionUpdateTeidHost(session, fTeid->teid) == STATUS_OK,
+                    return STATUS_ERROR, "Failed to update session TEID map");
+    }
+
+    if (pdi->uEIPAddress.presence) {
+        PfcpUeIpAddr *ueIp = (PfcpUeIpAddr *)pdi->uEIPAddress.value;
+        if (ueIp->v4) {
+            uint32_t ue_ip_key = htonl(ueIp->addr4.s_addr);
+            UTLT_Assert(UpfSessionUpdateUeIP(session, ue_ip_key) == STATUS_OK,
+                        return STATUS_ERROR, "Failed to update session UE-IP map");
+        }
+    }
+
+    return STATUS_OK;
+}
+
 
 // bool UpfClsRebuildAndPublish(uint32_t *out_version) {
 //     cls_handle_t *snap = cls_create(CLS_SELECTED_BACKEND_ID);
@@ -699,6 +724,9 @@ Status UpfN4HandleCreatePdr(UpfSession *session, CreatePDR *createPdr) {
 
     UTLT_Assert(_ConvertCreatePDRTlvToRule(upfPdr, createPdr) == STATUS_OK,
         return STATUS_ERROR, "Convert PDR TLV To Rule is failed");
+    UTLT_Assert(UpfN4SyncSessionPacketKeysFromPdi(session, &createPdr->pDI) == STATUS_OK,
+                rte_free(upfPdr); return STATUS_ERROR,
+                "Failed to sync session packet keys from CreatePDR");
 
     if (upfPdr->flags.farId) {
         upfPdr->far = UpfFARFindByID(session, upfPdr->farId);
@@ -1223,6 +1251,8 @@ Status UpfN4HandleUpdatePdr(UpfSession *session, UpdatePDR *updatePdr) {
 
     UTLT_Assert(_ConvertUpdatePDRTlvToRule(upfPdr, updatePdr) == STATUS_OK,
         return STATUS_ERROR, "Convert PDR TLV To Rule is failed");
+    UTLT_Assert(UpfN4SyncSessionPacketKeysFromPdi(session, &updatePdr->pDI) == STATUS_OK,
+                return STATUS_ERROR, "Failed to sync session packet keys from UpdatePDR");
 
     if (upfPdr->flags.farId) {
         upfPdr->far = UpfFARFindByID(session, upfPdr->farId);

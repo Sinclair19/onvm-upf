@@ -42,7 +42,7 @@ worker_index_for_service(uint16_t service_id) {
 
 static inline uint16_t
 select_ul_worker(const gtp_parse_result_t *gtp_info) {
-    UpfSession *session = UpfSessionFindByTeid(rte_cpu_to_be_32(gtp_info->teid));
+    UpfSession *session = UpfSessionFindByTeidHost(gtp_info->teid);
     if (session) {
         return UpfSessionEnsureWorkerServiceId(session, gtp_info->teid);
     }

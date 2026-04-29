@@ -204,6 +204,9 @@ UpfSession *UpfSessionAlloc(uint64_t seid);
 UpfSession *UpfSessionAddByMessage(PfcpMessage *message);
 Status InsertUEIPtoSessionMap(const uint32_t ue_ip, UpfSession *session);
 Status InsertTEIDtoSessionMap(const uint32_t teid, UpfSession *session);
+Status UpfSessionUpdateTeid(UpfSession *session, uint32_t teid);
+Status UpfSessionUpdateTeidHost(UpfSession *session, uint32_t teid_host);
+Status UpfSessionUpdateUeIP(UpfSession *session, uint32_t ue_ip);
 
 // Delete Session APIs
 void UpfSessionFree(UpfSession *);
@@ -214,6 +217,7 @@ void UeIpToUpfSessionMapFree(uint32_t ueip);
 // Find Session APIs
 UpfSession *UpfSessionFindBySeid(uint64_t seid);
 UpfSession *UpfSessionFindByTeid(uint32_t teid);
+UpfSession *UpfSessionFindByTeidHost(uint32_t teid_host);
 UpfSession *UpfSessionFindByUeIP(uint32_t ueip);
 uint16_t UpfSessionGetWorkerServiceId(const UpfSession *session);
 Status UpfSessionSetWorkerServiceId(UpfSession *session, uint16_t worker_service_id);
