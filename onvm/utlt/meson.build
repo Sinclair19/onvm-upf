@@ -19,7 +19,7 @@ utlt_sources = files(
   'utlt_unix_sock.c'
 )
 
-utlt_includes = include_directories('.', '../logger', '../onvm_nflib')
+utlt_includes = include_directories('.', '../logger', '../onvm_nflib', '../lib')
 
 libm_dep = cc.find_library('m')
 
