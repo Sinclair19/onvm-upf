@@ -5,8 +5,11 @@
 #include <string.h>
 
 #include <rte_common.h>
+#include <rte_arp.h>
+#include <rte_ethdev.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
+#include <rte_mempool.h>
 #include <rte_mbuf.h>
 
 #include "gtp.h"
@@ -19,6 +22,7 @@
 #include "upf_lb_config.h"
 
 #define NF_TAG "upf_lb"
+#define PKTMBUF_POOL_NAME "MProc_pktmbuf_pool"
 
 typedef struct {
     uint64_t non_ipv4_drop;
@@ -29,6 +33,104 @@ typedef struct {
 } upf_lb_stats_t;
 
 static upf_lb_stats_t g_upf_lb_stats;
+static struct rte_mempool *g_pktmbuf_pool;
+
+static inline int
+is_local_dataplane_ip(uint32_t ip_be) {
+    return ip_be == g_upf_lb_access_ip_be ||
+           (g_upf_lb_core_ip_be != 0 && ip_be == g_upf_lb_core_ip_be);
+}
+
+static int
+send_arp_reply(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
+               struct onvm_nf_local_ctx *nf_local_ctx) {
+    struct rte_ether_hdr *eth = onvm_pkt_ether_hdr(pkt);
+    if (!pkt || !meta || !nf_local_ctx || !nf_local_ctx->nf || !eth) {
+        if (meta) {
+            meta->action = ONVM_NF_ACTION_DROP;
+        }
+        return 0;
+    }
+
+    if (pkt->pkt_len < sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr)) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    struct rte_arp_hdr *arp = rte_pktmbuf_mtod_offset(
+        pkt, struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
+    if (!arp ||
+        rte_be_to_cpu_16(arp->arp_hardware) != RTE_ARP_HRD_ETHER ||
+        rte_be_to_cpu_16(arp->arp_protocol) != RTE_ETHER_TYPE_IPV4 ||
+        arp->arp_hlen != RTE_ETHER_ADDR_LEN ||
+        arp->arp_plen != sizeof(uint32_t)) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    if (rte_be_to_cpu_16(arp->arp_opcode) != RTE_ARP_OP_REQUEST ||
+        !is_local_dataplane_ip(arp->arp_data.arp_tip)) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    if (!g_pktmbuf_pool) {
+        g_pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
+    }
+    if (!g_pktmbuf_pool) {
+        UTLT_Error("UPF-LB cannot find mbuf pool %s", PKTMBUF_POOL_NAME);
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    struct rte_ether_addr local_mac;
+    if (rte_eth_macaddr_get(pkt->port, &local_mac) < 0) {
+        UTLT_Error("UPF-LB failed to get MAC for port %u", pkt->port);
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    struct rte_mbuf *reply = rte_pktmbuf_alloc(g_pktmbuf_pool);
+    if (!reply) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    size_t pkt_size = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
+    char *data = rte_pktmbuf_append(reply, pkt_size);
+    if (!data) {
+        rte_pktmbuf_free(reply);
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
+    struct rte_ether_hdr *out_eth = (struct rte_ether_hdr *)data;
+    struct rte_arp_hdr *out_arp = (struct rte_arp_hdr *)(out_eth + 1);
+
+    rte_ether_addr_copy(&local_mac, &out_eth->src_addr);
+    rte_ether_addr_copy(&arp->arp_data.arp_sha, &out_eth->dst_addr);
+    out_eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP);
+
+    out_arp->arp_hardware = rte_cpu_to_be_16(RTE_ARP_HRD_ETHER);
+    out_arp->arp_protocol = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    out_arp->arp_hlen = RTE_ETHER_ADDR_LEN;
+    out_arp->arp_plen = sizeof(uint32_t);
+    out_arp->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+    rte_ether_addr_copy(&local_mac, &out_arp->arp_data.arp_sha);
+    out_arp->arp_data.arp_sip = arp->arp_data.arp_tip;
+    rte_ether_addr_copy(&arp->arp_data.arp_sha, &out_arp->arp_data.arp_tha);
+    out_arp->arp_data.arp_tip = arp->arp_data.arp_sip;
+
+    struct onvm_pkt_meta *reply_meta =
+        onvm_get_pkt_meta(reply, nf_local_ctx->nf->dynfield_offset);
+    reply_meta->destination = pkt->port;
+    reply_meta->action = ONVM_NF_ACTION_OUT;
+
+    (void)onvm_nflib_return_pkt(nf_local_ctx->nf, reply);
+
+    meta->action = ONVM_NF_ACTION_DROP;
+    return 0;
+}
 
 static inline int
 worker_index_for_service(uint16_t service_id) {
@@ -66,7 +168,16 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
     meta->action = ONVM_NF_ACTION_DROP;
 
     struct rte_ether_hdr *eth = onvm_pkt_ether_hdr(pkt);
-    if (!eth || rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4) {
+    if (!eth) {
+        g_upf_lb_stats.non_ipv4_drop++;
+        return 0;
+    }
+
+    uint16_t ether_type = rte_be_to_cpu_16(eth->ether_type);
+    if (ether_type == RTE_ETHER_TYPE_ARP) {
+        return send_arp_reply(pkt, meta, nf_local_ctx);
+    }
+    if (ether_type != RTE_ETHER_TYPE_IPV4) {
         g_upf_lb_stats.non_ipv4_drop++;
         return 0;
     }
@@ -131,6 +242,9 @@ main(int argc, char *argv[]) {
         }
         rte_exit(EXIT_FAILURE, "Failed ONVM init\n");
     }
+
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    nf_local_ctx->nf->dynfield_offset = onvm_config->dynfield_offset;
 
     const char *config_path = "config/upf_lb.yaml";
     if (argc > arg_offset + 1) {

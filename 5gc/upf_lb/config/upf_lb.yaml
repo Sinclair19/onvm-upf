@@ -8,6 +8,7 @@ configuration:
 
   dataplane:
     upf_access_ip: "192.168.2.2"
+    upf_core_ip: "192.168.3.1"
 
   upf_u_workers:
     - 14

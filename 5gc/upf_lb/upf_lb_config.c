@@ -10,6 +10,7 @@
 #include "utlt_debug.h"
 
 uint32_t g_upf_lb_access_ip_be = 0;
+uint32_t g_upf_lb_core_ip_be = 0;
 uint16_t g_upf_lb_service_id = UPF_INVALID_SERVICE_ID;
 char g_upf_lb_log_level[16] = "warning";
 
@@ -142,6 +143,13 @@ do_parse(yaml_document_t *doc) {
     const char *access_ip_str = scalar_str(access_ip);
     if (!access_ip_str || parse_ipv4_address(access_ip_str, &g_upf_lb_access_ip_be) != 0) {
         fprintf(stderr, "[UPF-LB][CONFIG] invalid upf_access_ip\n");
+        return -1;
+    }
+
+    yaml_node_t *core_ip = map_get(doc, dataplane, "upf_core_ip");
+    const char *core_ip_str = scalar_str(core_ip);
+    if (core_ip_str && parse_ipv4_address(core_ip_str, &g_upf_lb_core_ip_be) != 0) {
+        fprintf(stderr, "[UPF-LB][CONFIG] invalid upf_core_ip\n");
         return -1;
     }
 
