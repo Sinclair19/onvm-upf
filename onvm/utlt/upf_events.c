@@ -105,13 +105,23 @@ UpfWorkerServiceValid(uint16_t service_id) {
     return false;
 }
 
+static uint32_t
+UpfMixTeid(uint32_t teid) {
+    teid ^= teid >> 16;
+    teid *= 0x7feb352dU;
+    teid ^= teid >> 15;
+    teid *= 0x846ca68bU;
+    teid ^= teid >> 16;
+    return teid;
+}
+
 uint16_t
 UpfSelectWorkerServiceIdByTeid(uint32_t teid) {
     if (g_upf_worker_count == 0) {
         return UPF_INVALID_SERVICE_ID;
     }
 
-    return g_upf_worker_service_ids[teid % g_upf_worker_count];
+    return g_upf_worker_service_ids[UpfMixTeid(teid) % g_upf_worker_count];
 }
 
 uint16_t
