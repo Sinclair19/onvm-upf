@@ -406,8 +406,19 @@ UpfSession *UpfSessionFindByUeIP(uint32_t ue_ip) {
                                                     (const void *)&ue_ip,
                                                     cal_hash, &data);
     if (status < 0) {
-        UTLT_Info("Not Found UpfSessionFindByUeIP[%u]", ue_ip);
-        return NULL;
+        uint32_t swapped_ue_ip = rte_bswap32(ue_ip);
+        if (swapped_ue_ip != ue_ip) {
+            cal_hash = UEIP_TO_HASH_KEY(swapped_ue_ip);
+            status = rte_hash_lookup_with_hash_data(ueip_upf_session_map->hash,
+                                                    (const void *)&swapped_ue_ip,
+                                                    cal_hash, &data);
+        }
+        if (status < 0) {
+            UTLT_Info("Not Found UpfSessionFindByUeIP[%u]", ue_ip);
+            return NULL;
+        }
+        UTLT_Warning("Found UE-IP mapping with byte-swapped key[%u] for lookup[%u]",
+                     swapped_ue_ip, ue_ip);
     }
     if (!data) {
         UTLT_Error("UE IP Mapping has no session index data");
@@ -478,8 +489,19 @@ UpfSession *UpfSessionFindByTeid(uint32_t teid) {
                                                     (const void *)&teid,
                                                     cal_hash, &data);
     if (status < 0) {
-        UTLT_Info("Not Found InsertTEIDtoSessionMap[%u]", teid);
-        return NULL;
+        uint32_t swapped_teid = rte_bswap32(teid);
+        if (swapped_teid != teid) {
+            cal_hash = TEID_TO_HASH_KEY(swapped_teid);
+            status = rte_hash_lookup_with_hash_data(teid_upf_session_map->hash,
+                                                    (const void *)&swapped_teid,
+                                                    cal_hash, &data);
+        }
+        if (status < 0) {
+            UTLT_Info("Not Found InsertTEIDtoSessionMap[%u]", teid);
+            return NULL;
+        }
+        UTLT_Warning("Found TEID mapping with byte-swapped key[%u] for lookup[%u]",
+                     swapped_teid, teid);
     }
     if (!data) {
         UTLT_Error("TEID Mapping has no session index data");

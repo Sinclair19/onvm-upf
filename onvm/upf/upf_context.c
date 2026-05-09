@@ -360,11 +360,11 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     //use to check srr flag
     session->srr_flag = false;
 
-    session->teid = rte_cpu_to_be_32(teid->teid);
-    session->worker_service_id = UpfSelectWorkerServiceIdByTeid(teid->teid);
+    session->teid = teid->teid;
+    session->worker_service_id = UpfSelectWorkerServiceIdByTeid(rte_be_to_cpu_32(teid->teid));
     session->pdn.paa.pdnType = pdnType;
     if (pdnType == PFCP_PDN_TYPE_IPV4) {
-        session->ueIpv4.addr4.s_addr = rte_cpu_to_be_32(ueIp->addr4.s_addr);
+        session->ueIpv4.addr4.s_addr = ueIp->addr4.s_addr;
     } else {
         UpfSessionRemove(session);
         UTLT_Assert(0, return NULL, "UnSupported PDN Type(%d)", pdnType);

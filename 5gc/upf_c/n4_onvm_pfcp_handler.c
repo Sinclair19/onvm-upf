@@ -193,15 +193,14 @@ UpfN4SyncSessionPacketKeysFromPdi(UpfSession *session, const PDI *pdi) {
 
     if (pdi->localFTEID.presence) {
         PfcpFTeid *fTeid = (PfcpFTeid *)pdi->localFTEID.value;
-        UTLT_Assert(UpfSessionUpdateTeidHost(session, fTeid->teid) == STATUS_OK,
+        UTLT_Assert(UpfSessionUpdateTeid(session, fTeid->teid) == STATUS_OK,
                     return STATUS_ERROR, "Failed to update session TEID map");
     }
 
     if (pdi->uEIPAddress.presence) {
         PfcpUeIpAddr *ueIp = (PfcpUeIpAddr *)pdi->uEIPAddress.value;
         if (ueIp->v4) {
-            uint32_t ue_ip_key = htonl(ueIp->addr4.s_addr);
-            UTLT_Assert(UpfSessionUpdateUeIP(session, ue_ip_key) == STATUS_OK,
+            UTLT_Assert(UpfSessionUpdateUeIP(session, ueIp->addr4.s_addr) == STATUS_OK,
                         return STATUS_ERROR, "Failed to update session UE-IP map");
         }
     }
