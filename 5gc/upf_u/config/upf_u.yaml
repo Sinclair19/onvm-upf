@@ -9,5 +9,5 @@ configuration:
     upf_n6_ip: "192.168.3.1"        # N6 interface IP address on the Core Network node
 
     ports:
-      n3_port: 0                     # NIC port used for N3 interface
-      n6_port: 1                     # NIC port used for N6 interface
+      n3_port: 1                     # NIC port used for N3 interface
+      n6_port: 0                     # NIC port used for N6 interface
