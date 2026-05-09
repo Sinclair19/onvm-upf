@@ -7,8 +7,8 @@ configuration:
   service_id: 1
 
   dataplane:
-    upf_access_ip: "192.168.1.2"
+    upf_access_ip: "192.168.2.2"
 
   upf_u_workers:
-    - 3
-    - 4
+    - 14
+    - 15

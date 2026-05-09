@@ -12,7 +12,7 @@ configuration:
     - addr: 127.0.0.8
 
   gtpu:
-    - addr: 192.168.1.2
+    - addr: 192.168.2.2
     # [optional] gtpu.name
     # - name: upf.5gc.nctu.me
     # [optional] gtpu.ifname
@@ -26,8 +26,8 @@ configuration:
     sgi: 1
 
   upf_u_workers:
-    - 3
-    - 4
+    - 14
+    - 15
 
   dnn_list:
     - dnn: internet
