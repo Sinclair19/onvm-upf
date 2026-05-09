@@ -361,7 +361,10 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     session->srr_flag = false;
 
     session->teid = teid->teid;
-    session->worker_service_id = UpfSelectWorkerServiceIdByTeid(rte_be_to_cpu_32(teid->teid));
+    session->worker_service_id = UpfSelectWorkerServiceIdRoundRobin();
+    if (session->worker_service_id == UPF_INVALID_SERVICE_ID) {
+        session->worker_service_id = UpfSelectWorkerServiceIdByTeid(rte_be_to_cpu_32(teid->teid));
+    }
     session->pdn.paa.pdnType = pdnType;
     if (pdnType == PFCP_PDN_TYPE_IPV4) {
         session->ueIpv4.addr4.s_addr = ueIp->addr4.s_addr;
@@ -379,6 +382,14 @@ UpfSession *UpfSessionAdd(PfcpUeIpAddr *ueIp,
     if (g_sess_buf && UpfSessBufRingCreate(session->index) < 0) {
         UTLT_Warning("SessBuf ring create failed for session index %d", session->index);
     }
+
+    char ue_ip_str[INET_ADDRSTRLEN] = {0};
+    const char *ue_ip_log = inet_ntop(AF_INET, &session->ueIpv4.addr4,
+                                      ue_ip_str, sizeof(ue_ip_str));
+    UTLT_Info("Assigned UPF-U worker %u to session index %d UE %s TEID %u",
+              session->worker_service_id, session->index,
+              ue_ip_log ? ue_ip_log : "<invalid>",
+              rte_be_to_cpu_32(session->teid));
 
     g_sessionIdPool++;
     return session;

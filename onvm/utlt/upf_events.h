@@ -25,6 +25,7 @@ int UpfWorkerConfigSet(const uint16_t *service_ids, uint16_t count);
 uint16_t UpfWorkerCount(void);
 uint16_t UpfWorkerServiceIdAt(uint16_t index);
 bool UpfWorkerServiceValid(uint16_t service_id);
+uint16_t UpfSelectWorkerServiceIdRoundRobin(void);
 uint16_t UpfSelectWorkerServiceIdByTeid(uint32_t teid);
 uint16_t UpfBroadcastEvt1ToWorkers(uint32_t type, uintptr_t a0);
 uint16_t UpfBroadcastEvt2ToWorkers(uint32_t type, uintptr_t a0, uintptr_t a1);

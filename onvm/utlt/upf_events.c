@@ -9,6 +9,7 @@
 
 static uint16_t g_upf_worker_service_ids[UPF_MAX_WORKERS];
 static uint16_t g_upf_worker_count = 0;
+static uint16_t g_upf_worker_rr_next = 0;
 
 int
 UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
@@ -51,6 +52,7 @@ void
 UpfWorkerConfigReset(void) {
     memset(g_upf_worker_service_ids, 0, sizeof(g_upf_worker_service_ids));
     g_upf_worker_count = 0;
+    g_upf_worker_rr_next = 0;
 }
 
 int
@@ -103,6 +105,17 @@ UpfWorkerServiceValid(uint16_t service_id) {
         }
     }
     return false;
+}
+
+uint16_t
+UpfSelectWorkerServiceIdRoundRobin(void) {
+    if (g_upf_worker_count == 0) {
+        return UPF_INVALID_SERVICE_ID;
+    }
+
+    uint16_t index = g_upf_worker_rr_next % g_upf_worker_count;
+    g_upf_worker_rr_next = (uint16_t)((index + 1) % g_upf_worker_count);
+    return g_upf_worker_service_ids[index];
 }
 
 static uint32_t
