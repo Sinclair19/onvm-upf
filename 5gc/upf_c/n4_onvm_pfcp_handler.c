@@ -21,6 +21,10 @@
 #include <endian.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <rte_memory.h>
@@ -65,6 +69,94 @@ static uint32_t      g_cls_ack_version = 0;
 static uint16_t      g_cls_ack_expected = 0;
 static uint16_t      g_cls_ack_received = 0;
 static uint16_t      g_cls_ack_sids[UPF_MAX_WORKERS];
+#define UPF_PCAP_REPLAY_TEID_MAX 16
+static bool          g_pcap_replay_teids_parsed = false;
+static uint16_t      g_pcap_replay_teid_count = 0;
+static uint32_t      g_pcap_replay_teids[UPF_PCAP_REPLAY_TEID_MAX];
+
+static void
+UpfParsePcapReplayTeids(void) {
+    if (g_pcap_replay_teids_parsed) {
+        return;
+    }
+    g_pcap_replay_teids_parsed = true;
+
+    const char *env = getenv("UPF_PCAP_REPLAY_TEID");
+    if (!env || !*env) {
+        return;
+    }
+
+    const char *p = env;
+    while (*p) {
+        while (*p == ',' || isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (!*p) {
+            break;
+        }
+
+        errno = 0;
+        char *end = NULL;
+        unsigned long value = strtoul(p, &end, 0);
+        if (errno != 0 || end == p || value > UINT32_MAX) {
+            UTLT_Warning("Ignoring invalid UPF_PCAP_REPLAY_TEID entry near '%s'", p);
+            break;
+        }
+        if (*end && *end != ',' && !isspace((unsigned char)*end)) {
+            UTLT_Warning("Ignoring invalid UPF_PCAP_REPLAY_TEID delimiter near '%s'", end);
+            break;
+        }
+
+        if (g_pcap_replay_teid_count < UPF_PCAP_REPLAY_TEID_MAX) {
+            g_pcap_replay_teids[g_pcap_replay_teid_count++] = (uint32_t)value;
+            UTLT_Info("PCAP replay TEID alias enabled: host-order TEID=%u",
+                      (uint32_t)value);
+        } else {
+            UTLT_Warning("Ignoring extra UPF_PCAP_REPLAY_TEID entry %lu; max is %u",
+                         value, UPF_PCAP_REPLAY_TEID_MAX);
+        }
+
+        p = end;
+    }
+}
+
+static uint16_t
+UpfGetPcapReplayTeids(const uint32_t **teids_host) {
+    UpfParsePcapReplayTeids();
+    if (teids_host) {
+        *teids_host = g_pcap_replay_teids;
+    }
+    return g_pcap_replay_teid_count;
+}
+
+static Status
+UpfSessionEnsurePcapReplayTeidAlias(UpfSession *session, uint32_t replay_teid_host) {
+    UTLT_Assert(session, return STATUS_ERROR, "session not found");
+
+    uint32_t replay_teid = htonl(replay_teid_host);
+    if (session->teid == replay_teid) {
+        return STATUS_OK;
+    }
+
+    UpfSession *existing = UpfSessionFindByTeid(replay_teid);
+    if (existing == session) {
+        return STATUS_OK;
+    }
+    if (existing) {
+        UTLT_Warning("PCAP replay TEID alias %u already belongs to another session",
+                     replay_teid_host);
+        return STATUS_ERROR;
+    }
+
+    if (InsertTEIDtoSessionMap(replay_teid, session) != STATUS_OK) {
+        UTLT_Warning("Unable to add PCAP replay TEID alias %u", replay_teid_host);
+        return STATUS_ERROR;
+    }
+
+    UTLT_Info("Added PCAP replay TEID alias %u for session index %d",
+              replay_teid_host, session->index);
+    return STATUS_OK;
+}
 
 static inline void PdrRetireQEnsure(uint32_t need_extra) {
     uint32_t need = g_pdr_retire_len + need_extra;
@@ -195,6 +287,13 @@ UpfN4SyncSessionPacketKeysFromPdi(UpfSession *session, const PDI *pdi) {
         PfcpFTeid *fTeid = (PfcpFTeid *)pdi->localFTEID.value;
         UTLT_Assert(UpfSessionUpdateTeid(session, fTeid->teid) == STATUS_OK,
                     return STATUS_ERROR, "Failed to update session TEID map");
+
+        const uint32_t *replay_teids_host = NULL;
+        uint16_t replay_teid_count = UpfGetPcapReplayTeids(&replay_teids_host);
+        for (uint16_t i = 0; i < replay_teid_count; i++) {
+            UTLT_Assert(UpfSessionEnsurePcapReplayTeidAlias(session, replay_teids_host[i]) == STATUS_OK,
+                        return STATUS_ERROR, "Failed to add PCAP replay TEID alias");
+        }
     }
 
     if (pdi->uEIPAddress.presence) {
@@ -361,6 +460,28 @@ bool UpfClsRebuildAndPublish(uint32_t *out_version) {
             if (it) list_iterator_destroy(it);
             cls_destroy(snap);
             return false;
+        }
+
+        if (is_uplink && r.pdi.teid != 0) {
+            const uint32_t *replay_teids_host = NULL;
+            uint16_t replay_teid_count = UpfGetPcapReplayTeids(&replay_teids_host);
+            for (uint16_t i = 0; i < replay_teid_count; i++) {
+                uint32_t replay_teid_host = replay_teids_host[i];
+                if (r.pdi.teid == replay_teid_host) {
+                    continue;
+                }
+
+                pdr_t alias = r;
+                alias.pdi.teid = replay_teid_host;
+                desc = cls_insert_rule(snap, &alias);
+                if (unlikely(desc == 0)) {
+                    UTLT_Error("cls_insert_rule failed for PCAP replay TEID alias %u PDR id=%u",
+                               replay_teid_host, (unsigned)up->pdrId);
+                    if (it) list_iterator_destroy(it);
+                    cls_destroy(snap);
+                    return false;
+                }
+            }
         }
     }
     if (it) list_iterator_destroy(it);
