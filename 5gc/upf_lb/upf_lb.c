@@ -34,6 +34,7 @@ typedef struct {
 
 static upf_lb_stats_t g_upf_lb_stats;
 static struct rte_mempool *g_pktmbuf_pool;
+static int g_upf_lb_bench_drop;
 
 static inline int
 worker_index_for_service(uint16_t service_id);
@@ -282,6 +283,12 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
     }
 
     g_upf_lb_stats.worker_packets[worker_index]++;
+
+    if (g_upf_lb_bench_drop) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 0;
+    }
+
     meta->action = ONVM_NF_ACTION_TONF;
     meta->destination = owner_service_id;
     return 0;
@@ -321,6 +328,10 @@ main(int argc, char *argv[]) {
     }
 
     UTLT_SetLogLevel(g_upf_lb_log_level);
+    g_upf_lb_bench_drop = getenv("UPF_LB_BENCH_DROP") != NULL;
+    if (g_upf_lb_bench_drop) {
+        UTLT_Warning("UPF-LB benchmark drop mode enabled; packets are not forwarded to UPF-U");
+    }
 
     if (g_upf_lb_service_id != UPF_INVALID_SERVICE_ID &&
         nf_local_ctx->nf->service_id != g_upf_lb_service_id) {
