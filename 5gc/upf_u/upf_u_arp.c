@@ -28,6 +28,7 @@
 
 #define PKTMBUF_POOL_NAME "MProc_pktmbuf_pool"
 #define NEIGH_TIMEOUT_SEC 300
+#define ARP_REQUEST_RETRY_SEC 1
 
 /* Broadcast MAC address */
 static const struct rte_ether_addr broadcast_mac = {
@@ -156,6 +157,16 @@ send_arp_request(uint16_t port,
     if (nf == NULL)
         return -1;
 
+    uint64_t now = rte_get_tsc_cycles();
+    uint64_t hz = rte_get_tsc_hz();
+    struct neigh_entry *e = neigh_lookup(port, tip_be);
+    if (e != NULL &&
+        e->state == NEIGH_INCOMPLETE &&
+        hz > 0 &&
+        now - e->last_update_tsc < (uint64_t)ARP_REQUEST_RETRY_SEC * hz) {
+        return 0;
+    }
+
     if (g_pktmbuf_pool == NULL) {
         g_pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
         if (g_pktmbuf_pool == NULL) {
@@ -202,25 +213,37 @@ send_arp_request(uint16_t port,
     arp_hdr->arp_data.arp_tip = tip_be;
 
     /* Mark neighbor INCOMPLETE if not already there */
-    struct neigh_entry *e = neigh_lookup(port, tip_be);
     if (e == NULL) {
         uint32_t start = neigh_hash(port, tip_be);
         uint32_t idx = start;
+        int inserted = 0;
+
         do {
             if (!neigh_tbl[idx].in_use) {
                 neigh_tbl[idx].in_use = 1;
                 neigh_tbl[idx].port_id = port;
                 neigh_tbl[idx].ip_be = tip_be;
                 memset(&neigh_tbl[idx].mac, 0, sizeof(struct rte_ether_addr));
-                neigh_tbl[idx].last_update_tsc = rte_get_tsc_cycles();
+                neigh_tbl[idx].last_update_tsc = now;
                 neigh_tbl[idx].state = NEIGH_INCOMPLETE;
+                inserted = 1;
                 break;
             }
             idx = (idx + 1) % NEIGH_MAX;
         } while (idx != start);
-    } else if (e->state == NEIGH_STALE) {
+
+        if (!inserted) {
+            idx = start;
+            neigh_tbl[idx].in_use = 1;
+            neigh_tbl[idx].port_id = port;
+            neigh_tbl[idx].ip_be = tip_be;
+            memset(&neigh_tbl[idx].mac, 0, sizeof(struct rte_ether_addr));
+            neigh_tbl[idx].last_update_tsc = now;
+            neigh_tbl[idx].state = NEIGH_INCOMPLETE;
+        }
+    } else if (e->state == NEIGH_STALE || e->state == NEIGH_INCOMPLETE) {
         e->state = NEIGH_INCOMPLETE;
-        e->last_update_tsc = rte_get_tsc_cycles();
+        e->last_update_tsc = now;
     }
 
     pmeta = onvm_get_pkt_meta(out_pkt, nf->dynfield_offset);
