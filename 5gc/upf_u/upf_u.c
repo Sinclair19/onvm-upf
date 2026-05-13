@@ -26,7 +26,6 @@
 #include <string.h>
 #include <sys/queue.h>
 #include <time.h>
-#include <unistd.h>
 #include <stdbool.h>
 
 #include <rte_common.h>
@@ -564,6 +563,22 @@ updateTokenbyIndex(int index) {
     }
     UTLT_Error("UE IP not found in the table");
     return;
+}
+
+static inline bool
+consumeUeBucketTokens(int index, bool is_qos, uint32_t pkt_len) {
+    if (unlikely(index < 0))
+        return false;
+
+    updateTokenbyIndex(index);
+
+    struct tb_config *tb = is_qos ? &ue_table[index].ue_qos_tb_params
+                                  : &ue_table[index].ue_nqos_tb_params;
+    if (tb->tb_tokens < pkt_len)
+        return false;
+
+    tb->tb_tokens -= pkt_len;
+    return true;
 }
 
 uint64_t seid = 0;
@@ -1154,22 +1169,18 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                     meta->action = ONVM_NF_ACTION_DROP;
                     goto dl_nocp;
                 }
-                if (meta->flags == RTE_COLOR_GREEN) {
-                    ue_table[ue_idx].ue_qos_tb_params.tb_tokens -= cal_pktlen;
-                }
-                if (meta->flags == RTE_COLOR_YELLOW) {
-                    while (ue_table[ue_idx].ue_qos_tb_params.tb_tokens < cal_pktlen) {
-                        updateTokenbyIndex(ue_idx);
-                        usleep(1);
+                if (meta->flags == RTE_COLOR_GREEN ||
+                    meta->flags == RTE_COLOR_YELLOW) {
+                    if (!consumeUeBucketTokens(ue_idx, true, cal_pktlen)) {
+                        meta->action = ONVM_NF_ACTION_DROP;
+                        goto dl_nocp;
                     }
-                    ue_table[ue_idx].ue_qos_tb_params.tb_tokens -= cal_pktlen;
                 }
             } else {
-                while (ue_table[ue_idx].ue_nqos_tb_params.tb_tokens < cal_pktlen) {
-                    updateTokenbyIndex(ue_idx);
-                    usleep(1);
+                if (!consumeUeBucketTokens(ue_idx, false, cal_pktlen)) {
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
                 }
-                ue_table[ue_idx].ue_nqos_tb_params.tb_tokens -= cal_pktlen;
             }
         }
 
