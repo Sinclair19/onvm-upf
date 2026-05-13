@@ -891,10 +891,11 @@ HandlePacketWithFar(struct rte_mbuf *pkt, UPDK_FAR *far, UPDK_QER *qer,
 }
 
 /* Per-session drain helper
- * Dequeue up to max_pkts from session ring, set meta OUT, and TX.
- * Returns the number of packets actually transmitted. */
+ * Dequeue up to max_pkts from session ring and set meta OUT.
+ * Returns the number of packets handed to the ONVM TX path. */
 static uint32_t
-drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
+drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf,
+                    bool enqueue_tx_after) {
     UpfSessBuf *sb = &g_sess_buf[sess_idx];
     if (!sb->ring_created || !sb->ring)
         return 0;
@@ -920,9 +921,10 @@ drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
 
         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, drain_buf,
                                   onvm_config->dynfield_offset, n, nf);
-        onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
         total += n;
     }
+    if (enqueue_tx_after && total > 0)
+        onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
     if (rte_ring_count(sb->ring) == 0)
         sb->touched = 0;
     return total;
@@ -1188,7 +1190,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
          * then forward the current packet immediately (no enqueue). */
         sb->is_buffering = 0;
         if (sb->touched)
-            drain_session_batch(sess_idx, INLINE_DRAIN_BATCH, nf);
+            drain_session_batch(sess_idx, INLINE_DRAIN_BATCH, nf, false);
 
         meta->action = ONVM_NF_ACTION_OUT;
 
@@ -1265,7 +1267,7 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
         int sess_idx = (int)(uintptr_t)e->arg0;
         if (sess_idx >= 0 && sess_idx < SESS_BUF_MAX_USERS) {
             g_sess_buf[sess_idx].is_buffering = 0;
-            uint32_t n = drain_session_batch(sess_idx, UINT32_MAX, nf);
+            uint32_t n = drain_session_batch(sess_idx, UINT32_MAX, nf, true);
             UTLT_Debug("EVENT drain: sess %d, sent %u pkts\n", sess_idx, n);
         }
         rte_free(e);
