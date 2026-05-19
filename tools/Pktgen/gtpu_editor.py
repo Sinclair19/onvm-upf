@@ -14,11 +14,11 @@ python3 gtpu_editor.py \
 
 #!/usr/bin/env python3
 import argparse
-from scapy.all import rdpcap, wrpcap, Ether, IP, UDP
+from scapy.all import rdpcap, wrpcap, Ether, IP, UDP, Raw
 from scapy.contrib.gtp import GTP_U_Header
 
 
-def rewrite_gtpu_packet(pkt, args):
+def rewrite_gtpu_packet(pkt, args, seq_num=None):
     """
     Rewrite outer MAC/IP/UDP, inner MAC/IP/UDP, and GTP-U header fields.
     """
@@ -57,6 +57,8 @@ def rewrite_gtpu_packet(pkt, args):
         gtp.teid = args.teid
     if args.gtpu_type is not None:
         gtp.gtp_type = args.gtpu_type
+    if hasattr(gtp, "length"):
+        del gtp.length
 
     # ---------- Inner payload (inside GTP-U) ----------
     inner = gtp.payload
@@ -81,12 +83,18 @@ def rewrite_gtpu_packet(pkt, args):
             inner[UDP].sport = args.inner_src_port
         if args.inner_dst_port is not None:
             inner[UDP].dport = args.inner_dst_port
+        if seq_num is not None:
+            seq = seq_num.to_bytes(4, "big")
+            if Raw in inner[UDP]:
+                inner[UDP][Raw].load = seq + inner[UDP][Raw].load
+            else:
+                inner[UDP].add_payload(Raw(seq))
         if hasattr(inner[UDP], "len"):
             del inner[UDP].len
         if hasattr(inner[UDP], "chksum"):
             del inner[UDP].chksum
 
-    return pkt
+    return pkt.__class__(bytes(pkt))
 
 
 def main():
@@ -136,8 +144,10 @@ def main():
 
     for pkt in packets:
         if UDP in pkt and pkt[UDP].dport == 2152 and GTP_U_Header in pkt:
+            new_packets.append(rewrite_gtpu_packet(pkt, args, modified))
             modified += 1
-        new_packets.append(rewrite_gtpu_packet(pkt, args))
+        else:
+            new_packets.append(rewrite_gtpu_packet(pkt, args))
 
     print(f"[*] Modified {modified} GTP-U packets")
     print(f"[*] Writing {args.out_pcap}")
