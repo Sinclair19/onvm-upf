@@ -435,6 +435,12 @@ attach_l2_or_arp(struct rte_mbuf *pkt,
 
     ne = neigh_lookup(out_port, next_hop_ip_be);
     if (ne == NULL || ne->state != NEIGH_REACHABLE) {
+        char local[16], next_hop[16];
+        UTLT_Warning("attach_l2_or_arp: unresolved neighbor port=%u local=%s next_hop=%s state=%u; sent/queued ARP request and dropped current packet",
+                     out_port,
+                     ipv4_to_buf(local_ip_be, local),
+                     ipv4_to_buf(next_hop_ip_be, next_hop),
+                     ne ? ne->state : NEIGH_EMPTY);
         (void)send_arp_request(out_port, local_ip_be, next_hop_ip_be, nf);
         return -1;
     }

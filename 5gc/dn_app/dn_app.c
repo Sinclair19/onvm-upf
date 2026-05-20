@@ -53,6 +53,7 @@
 #include <rte_cycles.h>
 #include <rte_ip.h>
 #include <rte_mbuf.h>
+#include <rte_udp.h>
 
 #include "onvm_nflib.h"
 #include "onvm_pkt_helper.h"
@@ -68,6 +69,39 @@ static uint64_t cur_cycles;
 
 /* shared data structure containing host port info */
 extern struct port_info *ports;
+
+static void
+log_udp_payload_seq(struct rte_mbuf *pkt, const char *tag) {
+    static uint32_t logged = 0;
+    struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
+
+    if (iph == NULL || iph->next_proto_id != IPPROTO_UDP)
+        return;
+
+    uint8_t ihl = (iph->version_ihl & 0x0f) * 4;
+    if (pkt->pkt_len < sizeof(struct rte_ether_hdr) + ihl + sizeof(struct rte_udp_hdr) + sizeof(uint32_t))
+        return;
+
+    struct rte_udp_hdr *udp = rte_pktmbuf_mtod_offset(
+        pkt, struct rte_udp_hdr *, sizeof(struct rte_ether_hdr) + ihl);
+    uint32_t *seqp = rte_pktmbuf_mtod_offset(
+        pkt, uint32_t *, sizeof(struct rte_ether_hdr) + ihl + sizeof(struct rte_udp_hdr));
+    uint32_t seq = rte_be_to_cpu_32(*seqp);
+
+    if (logged < 16 || (total_packets % print_delay) == 0) {
+        printf("[dn_app] %s seq=%" PRIu32 " %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u len=%u port=%u\n",
+               tag,
+               seq,
+               ((uint8_t *)&iph->src_addr)[0], ((uint8_t *)&iph->src_addr)[1],
+               ((uint8_t *)&iph->src_addr)[2], ((uint8_t *)&iph->src_addr)[3],
+               rte_be_to_cpu_16(udp->src_port),
+               ((uint8_t *)&iph->dst_addr)[0], ((uint8_t *)&iph->dst_addr)[1],
+               ((uint8_t *)&iph->dst_addr)[2], ((uint8_t *)&iph->dst_addr)[3],
+               rte_be_to_cpu_16(udp->dst_port),
+               pkt->pkt_len, pkt->port);
+        logged++;
+    }
+}
 
 /*
  * Print a usage message
@@ -172,13 +206,23 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
 
 	struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
 	if (iph) {
+        log_udp_payload_seq(pkt, "rx");
 		onvm_pkt_swap_ip_hdr(iph);
 	}
+
+    struct rte_udp_hdr *udp = onvm_pkt_udp_hdr(pkt);
+    if (udp) {
+        uint16_t src_port = udp->src_port;
+        udp->src_port = udp->dst_port;
+        udp->dst_port = src_port;
+    }
 
 	struct rte_ether_hdr *ether = onvm_pkt_ether_hdr(pkt);
 	if (ether) {
 		onvm_pkt_swap_ether_hdr(ether);
 	}
+
+    log_udp_payload_seq(pkt, "tx");
 
     return 0;
 }
