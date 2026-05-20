@@ -48,9 +48,13 @@
 #include <string.h>
 #include <sys/queue.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 #include <rte_common.h>
+#include <rte_arp.h>
 #include <rte_cycles.h>
+#include <rte_ether.h>
+#include <rte_ethdev.h>
 #include <rte_ip.h>
 #include <rte_mbuf.h>
 #include <rte_udp.h>
@@ -62,6 +66,7 @@
 
 /* number of package between each print */
 static uint32_t print_delay = 1000000;
+static uint32_t app_ip_be;
 
 static uint32_t total_packets = 0;
 static uint64_t last_cycle;
@@ -69,6 +74,75 @@ static uint64_t cur_cycles;
 
 /* shared data structure containing host port info */
 extern struct port_info *ports;
+
+static int
+parse_ipv4_be(const char *s, uint32_t *out)
+{
+    struct in_addr addr;
+
+    if (s == NULL || out == NULL || inet_pton(AF_INET, s, &addr) != 1)
+        return -1;
+
+    *out = addr.s_addr;
+    return 0;
+}
+
+static const char *
+ipv4_to_buf(uint32_t be_addr, char buf[16])
+{
+    inet_ntop(AF_INET, &be_addr, buf, 16);
+    return buf;
+}
+
+static int
+handle_arp_echo(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta)
+{
+    struct rte_ether_hdr *eth;
+    struct rte_arp_hdr *arp;
+    struct rte_ether_addr local_mac;
+    char ip[16];
+
+    eth = onvm_pkt_ether_hdr(pkt);
+    if (eth == NULL ||
+        rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_ARP) {
+        return 0;
+    }
+
+    if (pkt->pkt_len < sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr)) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 1;
+    }
+
+    arp = rte_pktmbuf_mtod_offset(pkt, struct rte_arp_hdr *,
+                                  sizeof(struct rte_ether_hdr));
+
+    if (rte_be_to_cpu_16(arp->arp_opcode) != RTE_ARP_OP_REQUEST ||
+        arp->arp_data.arp_tip != app_ip_be) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 1;
+    }
+
+    if (rte_eth_macaddr_get(pkt->port, &local_mac) < 0) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return 1;
+    }
+
+    rte_ether_addr_copy(&eth->src_addr, &eth->dst_addr);
+    rte_ether_addr_copy(&local_mac, &eth->src_addr);
+
+    arp->arp_opcode = rte_cpu_to_be_16(RTE_ARP_OP_REPLY);
+    rte_ether_addr_copy(&arp->arp_data.arp_sha, &arp->arp_data.arp_tha);
+    arp->arp_data.arp_tip = arp->arp_data.arp_sip;
+    rte_ether_addr_copy(&local_mac, &arp->arp_data.arp_sha);
+    arp->arp_data.arp_sip = app_ip_be;
+
+    meta->action = ONVM_NF_ACTION_OUT;
+    meta->destination = pkt->port;
+
+    printf("[dn_app] arp reply ip=%s port=%u\n",
+           ipv4_to_buf(app_ip_be, ip), pkt->port);
+    return 1;
+}
 
 static void
 log_udp_payload_seq(struct rte_mbuf *pkt, const char *tag) {
@@ -113,6 +187,7 @@ usage(const char *progname) {
     printf("%s -F <CONFIG_FILE.json> [EAL args] -- [NF_LIB args] -- [NF args]\n\n", progname);
     printf("Flags:\n");
     printf(" - `-p <print_delay>`: number of packets between each print, e.g. `-p 1` prints every packets.\n");
+    printf(" - `-a <ip>`: IPv4 address to answer ARP for, default 192.168.3.2.\n");
 }
 
 /*
@@ -122,15 +197,22 @@ static int
 parse_app_args(int argc, char *argv[], const char *progname) {
     int c;
 
-    while ((c = getopt(argc, argv, "p:")) != -1) {
+    while ((c = getopt(argc, argv, "p:a:")) != -1) {
         switch (c) {
             case 'p':
                 print_delay = strtoul(optarg, NULL, 10);
                 RTE_LOG(INFO, APP, "print_delay = %d\n", print_delay);
                 break;
+            case 'a':
+                if (parse_ipv4_be(optarg, &app_ip_be) != 0) {
+                    RTE_LOG(INFO, APP, "Invalid IPv4 address `%s'.\n", optarg);
+                    return -1;
+                }
+                RTE_LOG(INFO, APP, "app_ip = %s\n", optarg);
+                break;
             case '?':
                 usage(progname);
-                if (optopt == 'p')
+                if (optopt == 'p' || optopt == 'a')
                     RTE_LOG(INFO, APP, "Option -%c requires an argument.\n", optopt);
                 else if (isprint(optopt))
                     RTE_LOG(INFO, APP, "Unknown option `-%c'.\n", optopt);
@@ -204,6 +286,10 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
     meta->action = ONVM_NF_ACTION_OUT;
     meta->destination = pkt->port;
 
+    if (handle_arp_echo(pkt, meta)) {
+        return 0;
+    }
+
 	struct rte_ipv4_hdr *iph = onvm_pkt_ipv4_hdr(pkt);
 	if (iph) {
         log_udp_payload_seq(pkt, "rx");
@@ -261,6 +347,9 @@ main(int argc, char *argv[]) {
 
     cur_cycles = rte_get_tsc_cycles();
     last_cycle = rte_get_tsc_cycles();
+    if (app_ip_be == 0 && parse_ipv4_be("192.168.3.2", &app_ip_be) != 0) {
+        rte_exit(EXIT_FAILURE, "Invalid default DN app IP\n");
+    }
 
     onvm_nflib_run(nf_local_ctx);
 
