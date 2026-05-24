@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <rte_cycles.h>
 
@@ -28,11 +30,14 @@ struct onvm_perf_stats {
         uint32_t sample_rate;
         uint32_t countdown;
         uint8_t initialized;
+        FILE *out;
+        uint8_t file_output;
 };
 
 static inline void
 onvm_perf_init(struct onvm_perf_stats *stats, const char *name) {
         const char *sample_rate_env;
+        const char *stats_dir_env;
         uint32_t sample_rate = ONVM_PERF_DEFAULT_SAMPLE_RATE;
 
         if (stats->initialized)
@@ -50,6 +55,28 @@ onvm_perf_init(struct onvm_perf_stats *stats, const char *name) {
         stats->period_min_cycles = UINT64_MAX;
         stats->last_print_cycles = rte_get_tsc_cycles();
         stats->sample_rate = sample_rate;
+
+        stats_dir_env = "/home/ubuntu/mylog"; //getenv("ONVM_COMP_STATS_DIR");
+        if (stats_dir_env != NULL && stats_dir_env[0] != '\0') {
+                char path[512];
+                int n = snprintf(path, sizeof(path), "%s/component_%s_%ld.csv",
+                                 stats_dir_env, name, (long)getpid());
+                if (n > 0 && n < (int)sizeof(path)) {
+                        stats->out = fopen(path, "a");
+                        if (stats->out != NULL) {
+                                stats->file_output = 1;
+                                setvbuf(stats->out, NULL, _IOLBF, 0);
+                                if (ftell(stats->out) == 0) {
+                                        fprintf(stats->out,
+                                                "timestamp,component,pid,packets,samples,"
+                                                "period_samples,max_us,avg_us,min_us\n");
+                                }
+                        } else {
+                                stats->out = NULL;
+                        }
+                }
+        }
+
         stats->initialized = 1;
 }
 
@@ -97,19 +124,34 @@ onvm_perf_sample_batch_begin(struct onvm_perf_stats *stats, const char *name,
 static inline void
 onvm_perf_print_if_due(struct onvm_perf_stats *stats, uint64_t now_cycles) {
         uint64_t hz = rte_get_timer_hz();
+        double max_us;
+        double avg_us;
+        double min_us;
 
         if (stats->period_samples == 0 ||
             now_cycles - stats->last_print_cycles < hz * ONVM_PERF_PRINT_INTERVAL_SEC)
                 return;
 
-        printf("%s component samples: %" PRIu64 " packets: %" PRIu64 "\n",
-               stats->name, stats->samples, stats->packets);
-        printf("%s component max/avg/min: %.3f/%.3f/%.3f us\n",
-               stats->name,
-               (double)stats->period_max_cycles * 1000000.0 / (double)hz,
-               (double)stats->period_total_cycles * 1000000.0 /
-                   ((double)hz * (double)stats->period_samples),
-               (double)stats->period_min_cycles * 1000000.0 / (double)hz);
+        max_us = (double)stats->period_max_cycles * 1000000.0 / (double)hz;
+        avg_us = (double)stats->period_total_cycles * 1000000.0 /
+            ((double)hz * (double)stats->period_samples);
+        min_us = (double)stats->period_min_cycles * 1000000.0 / (double)hz;
+
+        if (stats->file_output && stats->out != NULL) {
+                char timestamp[20];
+                time_t raw_time = time(NULL);
+                struct tm local_time;
+                if (localtime_r(&raw_time, &local_time) != NULL &&
+                    strftime(timestamp, sizeof(timestamp), "%F %T", &local_time) > 0) {
+                        fprintf(stats->out,
+                                "%s,%s,%ld,%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                                ",%.3f,%.3f,%.3f\n",
+                                timestamp, stats->name, (long)getpid(), stats->packets,
+                                stats->samples, stats->period_samples,
+                                max_us, avg_us, min_us);
+                }
+                fflush(stats->out);
+        }
 
         stats->period_samples = 0;
         stats->period_total_cycles = 0;

@@ -671,8 +671,8 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
             const uint8_t *payload = (const uint8_t *)(uh + 1);
             uint16_t udp_len = rte_be_to_cpu_16(uh->dgram_len);
             uint16_t payload_len = udp_len > sizeof(*uh) ? udp_len - sizeof(*uh) : 0;
-            log_udp_seq_sample("DL plain before PDR lookup", outer4, uh, payload,
-                               payload_len, 0, 0, pkt->port);
+            // log_udp_seq_sample("DL plain before PDR lookup", outer4, uh, payload,
+                            //    payload_len, 0, 0, pkt->port);
         }
     }
 
@@ -695,7 +695,7 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.is_uplink = false;
 
     /* ── 2) PartitionSort classifier ────────────────────────── */
-    log_classifier_key("DL", &key);
+    // log_classifier_key("DL", &key);
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
         UTLT_Error("Couldn't classify DL packet to a PDR");
@@ -747,10 +747,10 @@ GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
         const uint8_t *payload = (const uint8_t *)(innerU + 1);
         uint16_t udp_len = rte_be_to_cpu_16(innerU->dgram_len);
         uint16_t payload_len = udp_len > sizeof(*innerU) ? udp_len - sizeof(*innerU) : 0;
-        log_udp_seq_sample("UL inner before decap", inner4, innerU, payload,
+        // log_udp_seq_sample("UL inner before decap", inner4, innerU, payload,
                            payload_len, gtp_info->teid, gtp_info->qfi, pkt->port);
     }
-    log_classifier_key("UL", &key);
+    // log_classifier_key("UL", &key);
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
         UTLT_Error("Couldn't classify UL packet to a PDR");
