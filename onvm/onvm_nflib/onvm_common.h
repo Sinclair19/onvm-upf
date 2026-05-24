@@ -217,6 +217,7 @@ struct onvm_configuration {
                 uint8_t ONVM_NF_SHARE_CORES;
         } flags;
         int dynfield_offset;
+        int perf_trace_dynfield_offset;
 };
 
 struct core_status {

@@ -247,13 +247,15 @@ tx_thread_main(void *arg) {
                                         for (unsigned j = 0; j < tx_count; j++) {
                                                 onvm_perf_trace_record(&g_queue_upf_lb_txq_to_mgr_wait_stats,
                                                                        "queue_upf_lb_txq_to_mgr_wait",
-                                                                       pkts[j]);
+                                                                       pkts[j],
+                                                                       onvm_config->perf_trace_dynfield_offset);
                                         }
                                 } else if (nf->tag != NULL && strcmp(nf->tag, "upf_u") == 0) {
                                         for (unsigned j = 0; j < tx_count; j++) {
                                                 onvm_perf_trace_record(&g_queue_upf_u_txq_to_mgr_wait_stats,
                                                                        "queue_upf_u_txq_to_mgr_wait",
-                                                                       pkts[j]);
+                                                                       pkts[j],
+                                                                       onvm_config->perf_trace_dynfield_offset);
                                         }
                                 }
                                 onvm_pkt_process_tx_batch(tx_mgr, pkts, onvm_config->dynfield_offset, tx_count, nf);

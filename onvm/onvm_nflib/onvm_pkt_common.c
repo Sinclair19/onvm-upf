@@ -223,7 +223,7 @@ onvm_pkt_enqueue_nf(struct queue_mgr *tx_mgr, uint16_t dst_service_id, struct rt
         }
 
         nf_buf = &tx_mgr->nf_rx_bufs[dst_instance_id];
-        onvm_perf_trace_stamp(pkt);
+        onvm_perf_trace_stamp(pkt, onvm_config->perf_trace_dynfield_offset);
         nf_buf->buffer[nf_buf->count++] = pkt;
         if (nf_buf->count == PACKET_READ_SIZE) {
                 onvm_pkt_flush_nf_queue(tx_mgr, dst_instance_id, source_nf);
@@ -247,7 +247,8 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
         for (i = 0; i < port_buf->count; i++) {
                 onvm_perf_trace_record(&g_mgr_port_tx_buffer_wait_stats,
                                        "queue_mgr_port_tx_buffer_wait",
-                                       port_buf->buffer[i]);
+                                       port_buf->buffer[i],
+                                       onvm_config->perf_trace_dynfield_offset);
         }
 
         perf_start = onvm_perf_sample_batch_begin(&g_mgr_port_flush_perf_stats,
@@ -277,7 +278,8 @@ onvm_pkt_enqueue_tx_thread(struct packet_buf *pkt_buf, struct onvm_nf *nf) {
         if (nf != NULL && nf->tag != NULL &&
             (strcmp(nf->tag, "upf_lb") == 0 || strcmp(nf->tag, "upf_u") == 0)) {
                 for (i = 0; i < pkt_buf->count; i++) {
-                        onvm_perf_trace_stamp(pkt_buf->buffer[i]);
+                        onvm_perf_trace_stamp(pkt_buf->buffer[i],
+                                             onvm_config->perf_trace_dynfield_offset);
                 }
         }
 
@@ -303,7 +305,7 @@ onvm_pkt_enqueue_port(struct queue_mgr *tx_mgr, uint16_t port, struct rte_mbuf *
                 return;
 
         port_buf = &tx_mgr->tx_thread_info->port_tx_bufs[port];
-        onvm_perf_trace_stamp(buf);
+        onvm_perf_trace_stamp(buf, onvm_config->perf_trace_dynfield_offset);
         port_buf->buffer[port_buf->count++] = buf;
         if (port_buf->count == PACKET_READ_SIZE) {
                 onvm_pkt_flush_port_queue(tx_mgr, port);

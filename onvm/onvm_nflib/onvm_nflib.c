@@ -1046,11 +1046,13 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
                 if (perf_stats == &g_upf_lb_perf_stats)
                         onvm_perf_trace_record(&g_queue_mgr_to_upf_lb_rxq_wait_stats,
                                                "queue_mgr_to_upf_lb_rxq_wait",
-                                               (struct rte_mbuf *)pkts[i]);
+                                               (struct rte_mbuf *)pkts[i],
+                                               onvm_config->perf_trace_dynfield_offset);
                 else if (perf_stats == &g_upf_u_perf_stats)
                         onvm_perf_trace_record(&g_queue_mgr_to_upf_u_rxq_wait_stats,
                                                "queue_mgr_to_upf_u_rxq_wait",
-                                               (struct rte_mbuf *)pkts[i]);
+                                               (struct rte_mbuf *)pkts[i],
+                                               onvm_config->perf_trace_dynfield_offset);
 
                 if (perf_stats != NULL)
                         perf_start = onvm_perf_sample_begin(perf_stats, perf_name);

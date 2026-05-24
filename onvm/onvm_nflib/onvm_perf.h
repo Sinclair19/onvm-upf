@@ -103,13 +103,23 @@ onvm_perf_sampler_init(struct onvm_perf_sampler *sampler) {
         sampler->initialized = 1;
 }
 
+static inline uint64_t *
+onvm_perf_trace_field(struct rte_mbuf *pkt, int trace_offset) {
+        if (pkt == NULL || trace_offset < 0)
+                return NULL;
+
+        return RTE_MBUF_DYNFIELD(pkt, trace_offset, uint64_t *);
+}
+
 static inline void
-onvm_perf_trace_start(struct onvm_perf_sampler *sampler, struct rte_mbuf *pkt) {
-        if (pkt == NULL)
+onvm_perf_trace_start(struct onvm_perf_sampler *sampler, struct rte_mbuf *pkt,
+                      int trace_offset) {
+        uint64_t *trace_cycles = onvm_perf_trace_field(pkt, trace_offset);
+        if (trace_cycles == NULL)
                 return;
 
         onvm_perf_sampler_init(sampler);
-        pkt->udata64 = 0;
+        *trace_cycles = 0;
 
         if (sampler->sample_rate == 0)
                 return;
@@ -119,13 +129,14 @@ onvm_perf_trace_start(struct onvm_perf_sampler *sampler, struct rte_mbuf *pkt) {
                 return;
 
         sampler->countdown = 0;
-        pkt->udata64 = ONVM_PERF_TRACE_MARKER;
+        *trace_cycles = ONVM_PERF_TRACE_MARKER;
 }
 
 static inline void
-onvm_perf_trace_stamp(struct rte_mbuf *pkt) {
-        if (pkt != NULL && pkt->udata64 != 0)
-                pkt->udata64 = rte_get_tsc_cycles();
+onvm_perf_trace_stamp(struct rte_mbuf *pkt, int trace_offset) {
+        uint64_t *trace_cycles = onvm_perf_trace_field(pkt, trace_offset);
+        if (trace_cycles != NULL && *trace_cycles != 0)
+                *trace_cycles = rte_get_tsc_cycles();
 }
 
 static inline uint64_t
@@ -269,18 +280,21 @@ onvm_perf_sample_batch_end(struct onvm_perf_stats *stats, uint64_t start_cycles,
 
 static inline void
 onvm_perf_trace_record(struct onvm_perf_stats *stats, const char *name,
-                       struct rte_mbuf *pkt) {
+                       struct rte_mbuf *pkt, int trace_offset) {
         uint64_t now_cycles;
         uint64_t delta;
+        uint64_t *trace_cycles;
 
         onvm_perf_init(stats, name);
         stats->packets++;
 
-        if (pkt == NULL || pkt->udata64 == 0 || pkt->udata64 == ONVM_PERF_TRACE_MARKER)
+        trace_cycles = onvm_perf_trace_field(pkt, trace_offset);
+        if (trace_cycles == NULL || *trace_cycles == 0 ||
+            *trace_cycles == ONVM_PERF_TRACE_MARKER)
                 return;
 
         now_cycles = rte_get_tsc_cycles();
-        delta = now_cycles - pkt->udata64;
+        delta = now_cycles - *trace_cycles;
 
         stats->samples++;
         stats->total_cycles += delta;
@@ -296,7 +310,7 @@ onvm_perf_trace_record(struct onvm_perf_stats *stats, const char *name,
         if (delta > stats->period_max_cycles)
                 stats->period_max_cycles = delta;
 
-        pkt->udata64 = ONVM_PERF_TRACE_MARKER;
+        *trace_cycles = ONVM_PERF_TRACE_MARKER;
         onvm_perf_print_if_due(stats, now_cycles);
 }
 
