@@ -9,11 +9,19 @@
 #include <unistd.h>
 
 #include <rte_cycles.h>
+#include <rte_mbuf.h>
 
 // every 'N'th packet sampled
 #define ONVM_PERF_DEFAULT_SAMPLE_RATE 100 
 
 #define ONVM_PERF_PRINT_INTERVAL_SEC 1
+#define ONVM_PERF_TRACE_MARKER UINT64_MAX
+
+struct onvm_perf_sampler {
+        uint32_t sample_rate;
+        uint32_t countdown;
+        uint8_t initialized;
+};
 
 struct onvm_perf_stats {
         const char *name;
@@ -34,14 +42,10 @@ struct onvm_perf_stats {
         uint8_t file_output;
 };
 
-static inline void
-onvm_perf_init(struct onvm_perf_stats *stats, const char *name) {
+static inline uint32_t
+onvm_perf_get_sample_rate(void) {
         const char *sample_rate_env;
-        const char *stats_dir_env;
         uint32_t sample_rate = ONVM_PERF_DEFAULT_SAMPLE_RATE;
-
-        if (stats->initialized)
-                return;
 
         sample_rate_env = getenv("ONVM_COMP_SAMPLE_RATE");
         if (sample_rate_env != NULL) {
@@ -50,11 +54,21 @@ onvm_perf_init(struct onvm_perf_stats *stats, const char *name) {
                         sample_rate = (uint32_t)parsed;
         }
 
+        return sample_rate;
+}
+
+static inline void
+onvm_perf_init(struct onvm_perf_stats *stats, const char *name) {
+        const char *stats_dir_env;
+
+        if (stats->initialized)
+                return;
+
         stats->name = name;
         stats->min_cycles = UINT64_MAX;
         stats->period_min_cycles = UINT64_MAX;
         stats->last_print_cycles = rte_get_tsc_cycles();
-        stats->sample_rate = sample_rate;
+        stats->sample_rate = onvm_perf_get_sample_rate();
 
         stats_dir_env = "/home/ubuntu/mylog"; //getenv("ONVM_COMP_STATS_DIR");
         if (stats_dir_env != NULL && stats_dir_env[0] != '\0') {
@@ -78,6 +92,40 @@ onvm_perf_init(struct onvm_perf_stats *stats, const char *name) {
         }
 
         stats->initialized = 1;
+}
+
+static inline void
+onvm_perf_sampler_init(struct onvm_perf_sampler *sampler) {
+        if (sampler->initialized)
+                return;
+
+        sampler->sample_rate = onvm_perf_get_sample_rate();
+        sampler->initialized = 1;
+}
+
+static inline void
+onvm_perf_trace_start(struct onvm_perf_sampler *sampler, struct rte_mbuf *pkt) {
+        if (pkt == NULL)
+                return;
+
+        onvm_perf_sampler_init(sampler);
+        pkt->udata64 = 0;
+
+        if (sampler->sample_rate == 0)
+                return;
+
+        sampler->countdown++;
+        if (sampler->countdown < sampler->sample_rate)
+                return;
+
+        sampler->countdown = 0;
+        pkt->udata64 = ONVM_PERF_TRACE_MARKER;
+}
+
+static inline void
+onvm_perf_trace_stamp(struct rte_mbuf *pkt) {
+        if (pkt != NULL && pkt->udata64 != 0)
+                pkt->udata64 = rte_get_tsc_cycles();
 }
 
 static inline uint64_t
@@ -216,6 +264,39 @@ onvm_perf_sample_batch_end(struct onvm_perf_stats *stats, uint64_t start_cycles,
         if (delta > stats->period_max_cycles)
                 stats->period_max_cycles = delta;
 
+        onvm_perf_print_if_due(stats, now_cycles);
+}
+
+static inline void
+onvm_perf_trace_record(struct onvm_perf_stats *stats, const char *name,
+                       struct rte_mbuf *pkt) {
+        uint64_t now_cycles;
+        uint64_t delta;
+
+        onvm_perf_init(stats, name);
+        stats->packets++;
+
+        if (pkt == NULL || pkt->udata64 == 0 || pkt->udata64 == ONVM_PERF_TRACE_MARKER)
+                return;
+
+        now_cycles = rte_get_tsc_cycles();
+        delta = now_cycles - pkt->udata64;
+
+        stats->samples++;
+        stats->total_cycles += delta;
+        if (delta < stats->min_cycles)
+                stats->min_cycles = delta;
+        if (delta > stats->max_cycles)
+                stats->max_cycles = delta;
+
+        stats->period_samples++;
+        stats->period_total_cycles += delta;
+        if (delta < stats->period_min_cycles)
+                stats->period_min_cycles = delta;
+        if (delta > stats->period_max_cycles)
+                stats->period_max_cycles = delta;
+
+        pkt->udata64 = ONVM_PERF_TRACE_MARKER;
         onvm_perf_print_if_due(stats, now_cycles);
 }
 

@@ -111,6 +111,8 @@ struct onvm_configuration *onvm_config;
 
 static struct onvm_perf_stats g_upf_lb_perf_stats;
 static struct onvm_perf_stats g_upf_u_perf_stats;
+static struct onvm_perf_stats g_queue_mgr_to_upf_lb_rxq_wait_stats;
+static struct onvm_perf_stats g_queue_mgr_to_upf_u_rxq_wait_stats;
 
 /* Flag to check if shared core mutex sleep/wakeup is enabled */
 uint8_t ONVM_NF_SHARE_CORES;
@@ -1041,6 +1043,15 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
         for (i = 0; i < nb_pkts; i++) {
                 uint64_t perf_start = 0;
                 meta = onvm_get_pkt_meta((struct rte_mbuf *)pkts[i], pkt_meta_offset);
+                if (perf_stats == &g_upf_lb_perf_stats)
+                        onvm_perf_trace_record(&g_queue_mgr_to_upf_lb_rxq_wait_stats,
+                                               "queue_mgr_to_upf_lb_rxq_wait",
+                                               (struct rte_mbuf *)pkts[i]);
+                else if (perf_stats == &g_upf_u_perf_stats)
+                        onvm_perf_trace_record(&g_queue_mgr_to_upf_u_rxq_wait_stats,
+                                               "queue_mgr_to_upf_u_rxq_wait",
+                                               (struct rte_mbuf *)pkts[i]);
+
                 if (perf_stats != NULL)
                         perf_start = onvm_perf_sample_begin(perf_stats, perf_name);
                 ret_act = (*handler)((struct rte_mbuf *)pkts[i], meta, nf_local_ctx);

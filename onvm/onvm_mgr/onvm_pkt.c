@@ -53,6 +53,7 @@
 #include "onvm_pkt.h"
 
 static struct onvm_perf_stats g_mgr_rx_perf_stats;
+static struct onvm_perf_sampler g_ingress_queue_sampler;
 
 /**********************************Interfaces*********************************/
 
@@ -96,6 +97,7 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                  */
 
                 (meta->chain_index)++;
+                onvm_perf_trace_start(&g_ingress_queue_sampler, pkts[i]);
                 onvm_pkt_enqueue_nf(rx_mgr, meta->destination, pkts[i], NULL);
         }
 
