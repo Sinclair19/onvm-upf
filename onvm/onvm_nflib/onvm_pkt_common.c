@@ -46,7 +46,11 @@
 
 ******************************************************************************/
 
+#include "onvm_perf.h"
 #include "onvm_pkt_common.h"
+
+static struct onvm_perf_stats g_mgr_tx_dispatch_perf_stats;
+static struct onvm_perf_stats g_mgr_port_flush_perf_stats;
 
 /**********************Internal Functions Prototypes**************************/
 
@@ -88,11 +92,18 @@ onvm_pkt_drop(struct rte_mbuf *pkt);
 void
 onvm_pkt_process_tx_batch(struct queue_mgr *tx_mgr, struct rte_mbuf *pkts[], int pkt_meta_offset, uint16_t tx_count, struct onvm_nf *nf) {
         uint16_t i;
+        uint64_t perf_start;
         struct onvm_pkt_meta *meta;
         struct packet_buf *out_buf;
 
         if (tx_mgr == NULL || pkts == NULL || nf == NULL)
                 return;
+
+        if (tx_mgr->mgr_type_t == MGR)
+                perf_start = onvm_perf_sample_batch_begin(&g_mgr_tx_dispatch_perf_stats,
+                                                          "onvm_mgr_tx_dispatch", tx_count);
+        else
+                perf_start = 0;
 
         for (i = 0; i < tx_count; i++) {
                 meta = onvm_get_pkt_meta(pkts[i], pkt_meta_offset);
@@ -124,9 +135,15 @@ onvm_pkt_process_tx_batch(struct queue_mgr *tx_mgr, struct rte_mbuf *pkts[], int
                 } else {
                         printf("ERROR invalid action : this shouldn't happen.\n");
                         onvm_pkt_drop(pkts[i]);
+                        if (tx_mgr->mgr_type_t == MGR)
+                                onvm_perf_sample_batch_end(&g_mgr_tx_dispatch_perf_stats,
+                                                           perf_start, tx_count);
                         return;
                 }
         }
+
+        if (tx_mgr->mgr_type_t == MGR)
+                onvm_perf_sample_batch_end(&g_mgr_tx_dispatch_perf_stats, perf_start, tx_count);
 }
 
 void
@@ -212,6 +229,7 @@ onvm_pkt_enqueue_nf(struct queue_mgr *tx_mgr, uint16_t dst_service_id, struct rt
 void
 onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
         uint16_t i, sent;
+        uint64_t perf_start;
         volatile struct tx_stats *tx_stats;
         struct packet_buf *port_buf;
 
@@ -221,6 +239,9 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
         port_buf = &tx_mgr->tx_thread_info->port_tx_bufs[port];
         if (port_buf->count == 0)
                 return;
+
+        perf_start = onvm_perf_sample_batch_begin(&g_mgr_port_flush_perf_stats,
+                                                  "onvm_mgr_port_flush", port_buf->count);
 
         tx_stats = &(ports->tx_stats);
         sent = rte_eth_tx_burst(port, tx_mgr->id, port_buf->buffer, port_buf->count);
@@ -232,6 +253,7 @@ onvm_pkt_flush_port_queue(struct queue_mgr *tx_mgr, uint16_t port) {
         }
         tx_stats->tx[port] += sent;
 
+        onvm_perf_sample_batch_end(&g_mgr_port_flush_perf_stats, perf_start, port_buf->count);
         port_buf->count = 0;
 }
 
