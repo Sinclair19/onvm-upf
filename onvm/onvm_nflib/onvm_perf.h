@@ -108,7 +108,7 @@ onvm_perf_trace_field(struct rte_mbuf *pkt, int trace_offset) {
         if (pkt == NULL || trace_offset < 0)
                 return NULL;
 
-        return RTE_MBUF_DYNFIELD(pkt, trace_offset, uint64_t *);
+        return (uint64_t *)((char *)pkt + trace_offset);
 }
 
 static inline void

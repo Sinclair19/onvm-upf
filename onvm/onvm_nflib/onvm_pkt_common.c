@@ -55,6 +55,8 @@ static struct onvm_perf_stats g_mgr_tx_dispatch_perf_stats;
 static struct onvm_perf_stats g_mgr_port_flush_perf_stats;
 static struct onvm_perf_stats g_mgr_port_tx_buffer_wait_stats;
 
+extern struct onvm_configuration *onvm_config;
+
 /**********************Internal Functions Prototypes**************************/
 
 /*
