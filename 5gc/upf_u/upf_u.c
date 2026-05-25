@@ -34,6 +34,8 @@
 #include <rte_ether.h>
 #include <rte_mbuf.h>
 #include <rte_meter.h>
+#include <rte_ring.h>
+#include <rte_ring_peek.h>
 
 #include "gtp.h"
 #include "upf_context.h"
@@ -64,6 +66,11 @@
 /* Used for buffering */
 #define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
 #define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
+
+/* Used for non-blocking UE token-bucket shaping */
+#define SHAPER_RING_SIZE        1024
+#define SHAPER_SCAN_BUDGET      32
+#define SHAPER_DRAIN_BUDGET     64
 
 enum { IF_UNKNOWN = -1 };
 
@@ -436,6 +443,23 @@ struct ue_tb {
 
 struct ue_tb ue_table[MAX_UE];
 
+enum shaper_queue_type {
+    SHAPER_Q_NQOS = 0,
+    SHAPER_Q_QOS_GREEN,
+    SHAPER_Q_QOS_YELLOW,
+    SHAPER_Q_COUNT
+};
+
+enum shaper_decision {
+    SHAPER_PASS = 0,
+    SHAPER_QUEUED,
+    SHAPER_DROP
+};
+
+static struct rte_ring *g_shaper_q[MAX_UE][SHAPER_Q_COUNT];
+static uint8_t g_shaper_active[MAX_UE];
+static uint16_t g_shaper_scan_cursor;
+
 void 
 initUeTable(){
     for (int i = 0; i < MAX_UE; i++) {
@@ -579,6 +603,187 @@ consumeUeBucketTokens(int index, bool is_qos, uint32_t pkt_len) {
 
     tb->tb_tokens -= pkt_len;
     return true;
+}
+
+static inline struct tb_config *
+getUeBucket(int index, bool is_qos) {
+    if (unlikely(index < 0 || index >= MAX_UE))
+        return NULL;
+
+    return is_qos ? &ue_table[index].ue_qos_tb_params
+                  : &ue_table[index].ue_nqos_tb_params;
+}
+
+static inline bool
+shaper_queue_has_pkts(int ue_idx, enum shaper_queue_type qtype) {
+    if (unlikely(ue_idx < 0 || ue_idx >= MAX_UE || qtype >= SHAPER_Q_COUNT))
+        return false;
+
+    struct rte_ring *q = g_shaper_q[ue_idx][qtype];
+    return q != NULL && rte_ring_count(q) > 0;
+}
+
+static int
+shaper_create_queue(int ue_idx, enum shaper_queue_type qtype, struct onvm_nf *nf) {
+    char name[RTE_RING_NAMESIZE];
+    uint16_t instance_id = nf ? nf->instance_id : 0;
+    struct rte_ring *q;
+
+    if (ue_idx < 0 || ue_idx >= MAX_UE || qtype >= SHAPER_Q_COUNT)
+        return -1;
+    if (g_shaper_q[ue_idx][qtype] != NULL)
+        return 0;
+
+    snprintf(name, sizeof(name), "us_%03u_%03d_%u",
+             instance_id, ue_idx, (unsigned)qtype);
+    q = rte_ring_lookup(name);
+    if (q == NULL) {
+        q = rte_ring_create(name, SHAPER_RING_SIZE, SOCKET_ID_ANY,
+                            RING_F_SP_ENQ | RING_F_SC_DEQ);
+    }
+    if (q == NULL) {
+        UTLT_Error("Failed to create UE shaper ring %s", name);
+        return -1;
+    }
+
+    g_shaper_q[ue_idx][qtype] = q;
+    return 0;
+}
+
+static int
+shaper_enqueue_packet(int ue_idx, enum shaper_queue_type qtype,
+                      struct rte_mbuf *pkt, uint32_t pkt_len,
+                      struct onvm_nf *nf) {
+    if (pkt == NULL || shaper_create_queue(ue_idx, qtype, nf) < 0)
+        return -1;
+
+    /* Queue only the mbuf pointer; hash.usr carries the original token charge. */
+    pkt->hash.usr = pkt_len;
+    rte_mbuf_refcnt_update(pkt, 1);
+    if (rte_ring_sp_enqueue(g_shaper_q[ue_idx][qtype], pkt) != 0) {
+        rte_mbuf_refcnt_update(pkt, -1);
+        return -1;
+    }
+
+    g_shaper_active[ue_idx] = 1;
+    return 0;
+}
+
+static enum shaper_decision
+shape_or_enqueue_packet(int ue_idx, enum shaper_queue_type qtype,
+                        bool is_qos, struct rte_mbuf *pkt,
+                        uint32_t pkt_len, struct onvm_pkt_meta *meta,
+                        struct onvm_nf *nf) {
+    struct tb_config *tb = getUeBucket(ue_idx, is_qos);
+
+    if (tb == NULL || pkt_len > tb->tb_depth) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return SHAPER_DROP;
+    }
+
+    if (!shaper_queue_has_pkts(ue_idx, qtype) &&
+        consumeUeBucketTokens(ue_idx, is_qos, pkt_len)) {
+        return SHAPER_PASS;
+    }
+
+    if (shaper_enqueue_packet(ue_idx, qtype, pkt, pkt_len, nf) == 0) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        return SHAPER_QUEUED;
+    }
+
+    meta->action = ONVM_NF_ACTION_DROP;
+    return SHAPER_DROP;
+}
+
+static uint32_t
+drain_shaper_queue(int ue_idx, enum shaper_queue_type qtype, bool is_qos,
+                   struct onvm_nf *nf, uint32_t *budget) {
+    struct rte_ring *q = g_shaper_q[ue_idx][qtype];
+    struct onvm_configuration *onvm_config;
+    struct rte_mbuf *tx_buf[DRAIN_CHUNK];
+    uint32_t nb_tx = 0;
+    uint32_t total = 0;
+
+    if (q == NULL || nf == NULL || budget == NULL || *budget == 0)
+        return 0;
+
+    onvm_config = onvm_nflib_get_onvm_config();
+    while (*budget > 0) {
+        struct rte_mbuf *pkt = NULL;
+        uint32_t pkt_len;
+
+        if (rte_ring_dequeue_burst_start(q, (void **)&pkt, 1, NULL) == 0)
+            break;
+
+        pkt_len = pkt->hash.usr ? pkt->hash.usr : pkt->pkt_len;
+        if (!consumeUeBucketTokens(ue_idx, is_qos, pkt_len)) {
+            rte_ring_dequeue_finish(q, 0);
+            break;
+        }
+
+        rte_ring_dequeue_finish(q, 1);
+        struct onvm_pkt_meta *m =
+            onvm_get_pkt_meta(pkt, onvm_config->dynfield_offset);
+        m->action = ONVM_NF_ACTION_OUT;
+        m->destination = g_n3_port;
+
+        tx_buf[nb_tx++] = pkt;
+        total++;
+        (*budget)--;
+
+        if (nb_tx == DRAIN_CHUNK) {
+            onvm_pkt_process_tx_batch(nf->nf_tx_mgr, tx_buf,
+                                      onvm_config->dynfield_offset,
+                                      nb_tx, nf);
+            nb_tx = 0;
+        }
+    }
+
+    if (nb_tx > 0) {
+        onvm_pkt_process_tx_batch(nf->nf_tx_mgr, tx_buf,
+                                  onvm_config->dynfield_offset, nb_tx, nf);
+    }
+    return total;
+}
+
+static uint32_t
+drain_ue_shaper(int ue_idx, struct onvm_nf *nf, uint32_t budget) {
+    uint32_t total = 0;
+
+    if (ue_idx < 0 || ue_idx >= MAX_UE || !g_shaper_active[ue_idx])
+        return 0;
+
+    total += drain_shaper_queue(ue_idx, SHAPER_Q_QOS_GREEN, true, nf, &budget);
+    total += drain_shaper_queue(ue_idx, SHAPER_Q_NQOS, false, nf, &budget);
+    total += drain_shaper_queue(ue_idx, SHAPER_Q_QOS_YELLOW, true, nf, &budget);
+
+    if (!shaper_queue_has_pkts(ue_idx, SHAPER_Q_QOS_GREEN) &&
+        !shaper_queue_has_pkts(ue_idx, SHAPER_Q_NQOS) &&
+        !shaper_queue_has_pkts(ue_idx, SHAPER_Q_QOS_YELLOW)) {
+        g_shaper_active[ue_idx] = 0;
+    }
+
+    if (total > 0)
+        onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
+    return total;
+}
+
+static uint32_t
+drain_shaper_queues(struct onvm_nf *nf) {
+    uint32_t total = 0;
+    uint32_t budget = SHAPER_DRAIN_BUDGET;
+
+    for (uint32_t scanned = 0; scanned < SHAPER_SCAN_BUDGET && budget > 0; scanned++) {
+        uint16_t ue_idx = g_shaper_scan_cursor;
+        uint32_t drained;
+
+        g_shaper_scan_cursor = (g_shaper_scan_cursor + 1) % MAX_UE;
+        drained = drain_ue_shaper(ue_idx, nf, budget);
+        total += drained;
+        budget -= drained;
+    }
+
+    return total;
 }
 
 uint64_t seid = 0;
@@ -1143,7 +1348,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             goto dl_nocp;
         }
 
-        /* QoS policing — FORW only */
+        /* QoS shaping — FORW only.  Over-token packets wait in bounded
+         * per-UE rings; only red or queue-overflow packets are dropped. */
         if (far_action == UPDK_FAR_APPLY_ACTION_FORW) {
             if (ue_idx < 0) {
                 UTLT_Error("No UE IP found in the table");
@@ -1173,16 +1379,21 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 }
                 if (meta->flags == RTE_COLOR_GREEN ||
                     meta->flags == RTE_COLOR_YELLOW) {
-                    if (!consumeUeBucketTokens(ue_idx, true, cal_pktlen)) {
-                        meta->action = ONVM_NF_ACTION_DROP;
+                    enum shaper_queue_type qtype =
+                        (meta->flags == RTE_COLOR_GREEN) ?
+                        SHAPER_Q_QOS_GREEN : SHAPER_Q_QOS_YELLOW;
+                    enum shaper_decision decision =
+                        shape_or_enqueue_packet(ue_idx, qtype, true, pkt,
+                                                cal_pktlen, meta, nf);
+                    if (decision != SHAPER_PASS)
                         goto dl_nocp;
-                    }
                 }
             } else {
-                if (!consumeUeBucketTokens(ue_idx, false, cal_pktlen)) {
-                    meta->action = ONVM_NF_ACTION_DROP;
+                enum shaper_decision decision =
+                    shape_or_enqueue_packet(ue_idx, SHAPER_Q_NQOS, false, pkt,
+                                            cal_pktlen, meta, nf);
+                if (decision != SHAPER_PASS)
                     goto dl_nocp;
-                }
             }
         }
 
@@ -1277,27 +1488,15 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (e) rte_free(e);
 }
 
-uint64_t last_p = NULL;
+uint64_t last_p = 0;
 
 static int 
 callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
     if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
-    uint64_t cur_p = rte_get_tsc_cycles(), before;
-    struct onvm_nf *nf;
-    struct onvm_pkt_meta *meta;
-    struct packet_buf *out_buf;
-    nf = nf_local_ctx->nf;
+    uint64_t cur_p = rte_get_tsc_cycles();
+    struct onvm_nf *nf = nf_local_ctx->nf;
 
-    // if (buffer_length > 0){
-    //     for (int i = 0; i < buffer_length; i++) {
-    //         meta = onvm_get_pkt_meta(buffer[i]);
-    //         meta->action = ONVM_NF_ACTION_OUT;
-    //     }
-    //     onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, buffer_length, nf);
-    //     onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
-    //     UTLT_Debug("Sending out %u packets\n", buffer_length);
-    //     buffer_length = 0;
-    // } 
+    drain_shaper_queues(nf);
 
     if (unlikely((cur_p - last_p)/(double)rte_get_timer_hz() > 1)){
         last_p = cur_p;
@@ -1321,7 +1520,7 @@ main(int argc, char *argv[]) {
     nf_function_table = onvm_nflib_init_nf_function_table();
     nf_function_table->pkt_handler = &packet_handler;
     nf_function_table->msg_handler = &msg_handler;
-    // nf_function_table->user_actions = &callback_handler;
+    nf_function_table->user_actions = &callback_handler;
 
     if ((arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table)) < 0) {
         onvm_nflib_stop(nf_local_ctx);
