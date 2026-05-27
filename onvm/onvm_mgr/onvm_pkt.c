@@ -49,16 +49,19 @@
 #include "onvm_mgr.h"
 
 #include "onvm_nf.h"
+#include "onvm_perf.h"
 #include "onvm_pkt.h"
+
+static struct onvm_perf_stats g_mgr_rx_perf_stats;
+static struct onvm_perf_sampler g_ingress_queue_sampler;
 
 /**********************************Interfaces*********************************/
 
 void
 onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uint16_t rx_count) {
         uint16_t i;
+        uint64_t perf_start;
         struct onvm_pkt_meta *meta;
-	struct rte_ether_hdr *eth_hdr;
-	uint16_t ether_type;
 #ifdef FLOW_LOOKUP
         struct onvm_flow_entry *flow_entry;
         struct onvm_service_chain *sc;
@@ -67,6 +70,8 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
 
         if (rx_mgr == NULL || pkts == NULL)
                 return;
+
+        perf_start = onvm_perf_sample_batch_begin(&g_mgr_rx_perf_stats, "onvm_mgr_rx", rx_count);
 
         for (i = 0; i < rx_count; i++) {
                 meta = onvm_get_pkt_meta(pkts[i], onvm_config->dynfield_offset);
@@ -92,10 +97,13 @@ onvm_pkt_process_rx_batch(struct queue_mgr *rx_mgr, struct rte_mbuf *pkts[], uin
                  */
 
                 (meta->chain_index)++;
+                onvm_perf_trace_start(&g_ingress_queue_sampler, pkts[i],
+                                      onvm_config->perf_trace_dynfield_offset);
                 onvm_pkt_enqueue_nf(rx_mgr, meta->destination, pkts[i], NULL);
         }
 
         onvm_pkt_flush_all_nfs(rx_mgr, NULL);
+        onvm_perf_sample_batch_end(&g_mgr_rx_perf_stats, perf_start, rx_count);
 }
 
 void

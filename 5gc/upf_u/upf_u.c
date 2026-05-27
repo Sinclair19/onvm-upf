@@ -789,17 +789,73 @@ drain_shaper_queues(struct onvm_nf *nf) {
 uint64_t seid = 0;
 uint16_t pdrId = 0;
 
+static inline uint32_t
+read_be32_unaligned(const void *p)
+{
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return rte_be_to_cpu_32(v);
+}
+
+static void
+log_udp_seq_sample(const char *tag, const struct rte_ipv4_hdr *ip,
+                   const struct rte_udp_hdr *udp, const uint8_t *payload,
+                   uint16_t payload_len, uint32_t teid, uint8_t qfi,
+                   uint16_t in_port)
+{
+    static uint32_t logged = 0;
+
+    if (!ip || !udp || !payload || payload_len < sizeof(uint32_t))
+        return;
+
+    if (logged < 32 || (logged % 100000) == 0) {
+        char src[16], dst[16];
+        uint32_t seq = read_be32_unaligned(payload);
+        UTLT_Warning("%s seq=%" PRIu32
+                     " %s:%u -> %s:%u teid=%" PRIu32 " qfi=%u in_port=%u",
+                     tag, seq,
+                     ipv4_to_buf(ip->src_addr, src),
+                     rte_be_to_cpu_16(udp->src_port),
+                     ipv4_to_buf(ip->dst_addr, dst),
+                     rte_be_to_cpu_16(udp->dst_port),
+                     teid, qfi, in_port);
+    }
+    logged++;
+}
+
+static void
+log_classifier_key(const char *tag, const ps_packet_t *key)
+{
+    static uint32_t logged = 0;
+
+    if (!key)
+        return;
+
+    if (logged < 32 || (logged % 100000) == 0) {
+        char ue[16], src[16], dst[16];
+        uint32_t ue_be = rte_cpu_to_be_32(key->ue_ip);
+        uint32_t src_be = rte_cpu_to_be_32(key->src_ip);
+        uint32_t dst_be = rte_cpu_to_be_32(key->dst_ip);
+        UTLT_Warning("%s key ue=%s src=%s:%u dst=%s:%u proto=%u teid=%" PRIu32
+                     " qfi=%u src_if=%" PRIu32 " is_ul=%u",
+                     tag,
+                     ipv4_to_buf(ue_be, ue),
+                     ipv4_to_buf(src_be, src), key->src_port,
+                     ipv4_to_buf(dst_be, dst), key->dst_port, key->proto, key->teid,
+                     key->qfi, key->source_if, key->is_uplink);
+    }
+    logged++;
+}
+
 UPDK_PDR *
 GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 {
     /* ── 1) Build classifier key ─────────────────────────────── */
     ps_packet_t key = {0};
-    uint8_t *pkt_data = rte_pktmbuf_mtod(pkt, uint8_t *);
 
     /* Outer (N6 / Core) IPv4 + UDP */
     struct rte_ipv4_hdr *outer4 = onvm_pkt_ipv4_hdr(pkt);
     if (!outer4) return NULL;
-    struct rte_udp_hdr  *outerU = onvm_pkt_udp_hdr(pkt);
 
     key.src_ip = rte_be_to_cpu_32(outer4->src_addr);
     key.dst_ip = rte_be_to_cpu_32(outer4->dst_addr);
@@ -817,6 +873,11 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
         if (uh) {
             sp = rte_be_to_cpu_16(uh->src_port);
             dp = rte_be_to_cpu_16(uh->dst_port);
+            const uint8_t *payload = (const uint8_t *)(uh + 1);
+            uint16_t udp_len = rte_be_to_cpu_16(uh->dgram_len);
+            uint16_t payload_len = udp_len > sizeof(*uh) ? udp_len - sizeof(*uh) : 0;
+            // log_udp_seq_sample("DL plain before PDR lookup", outer4, uh, payload,
+                            //    payload_len, 0, 0, pkt->port);
         }
     }
 
@@ -839,9 +900,10 @@ GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
     key.is_uplink = false;
 
     /* ── 2) PartitionSort classifier ────────────────────────── */
+    // log_classifier_key("DL", &key);
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
-        UTLT_Error("Couldn't classify the packet to a PDR");
+        UTLT_Error("Couldn't classify DL packet to a PDR");
         return NULL;
     }
 
@@ -863,8 +925,13 @@ GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
     if ((inner4->version_ihl >> 4) != 4) return NULL;
 
     uint8_t inner_ihl = (inner4->version_ihl & 0x0F) * 4;
-    struct rte_udp_hdr *innerU = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *,
-        inner_offset + inner_ihl);
+    struct rte_udp_hdr *innerU = NULL;
+    if (inner4->next_proto_id == IPPROTO_UDP) {
+        if (data_len < inner_offset + inner_ihl + sizeof(struct rte_udp_hdr))
+            return NULL;
+        innerU = rte_pktmbuf_mtod_offset(pkt, struct rte_udp_hdr *,
+            inner_offset + inner_ihl);
+    }
 
     // Build classifier key using pre-parsed values
     ps_packet_t key = {0};
@@ -873,17 +940,25 @@ GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
     key.ue_ip     = rte_be_to_cpu_32(inner4->src_addr);
     key.src_ip    = key.ue_ip;
     key.dst_ip    = rte_be_to_cpu_32(inner4->dst_addr);
-    key.src_port  = rte_be_to_cpu_16(innerU->src_port);
-    key.dst_port  = rte_be_to_cpu_16(innerU->dst_port);
+    key.src_port  = innerU ? rte_be_to_cpu_16(innerU->src_port) : 0;
+    key.dst_port  = innerU ? rte_be_to_cpu_16(innerU->dst_port) : 0;
     key.proto     = inner4->next_proto_id;
     key.tos_tc    = inner4->type_of_service;
     key.source_if = SRC_IF_ACCESS;
     key.is_uplink = true;
 
     /* ── PartitionSort classifier ──────────────────────────── */
+    if (innerU) {
+        const uint8_t *payload = (const uint8_t *)(innerU + 1);
+        uint16_t udp_len = rte_be_to_cpu_16(innerU->dgram_len);
+        uint16_t payload_len = udp_len > sizeof(*innerU) ? udp_len - sizeof(*innerU) : 0;
+        // log_udp_seq_sample("UL inner before decap", inner4, innerU, payload,
+        //                    payload_len, gtp_info->teid, gtp_info->qfi, pkt->port);
+    }
+    // log_classifier_key("UL", &key);
     const UPDK_PDR *pdr = UpfClassifyGetPdrPtr(&key);
     if (!pdr) {
-        UTLT_Error("Couldn't classify the packet to a PDR");
+        UTLT_Error("Couldn't classify UL packet to a PDR");
         return NULL;
     }
 

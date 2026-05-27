@@ -48,10 +48,12 @@
 ******************************************************************************/
 
 #include <signal.h>
+#include <string.h>
 
 #include "onvm_mgr.h"
 #include "onvm_nf.h"
 #include "onvm_pkt.h"
+#include "onvm_perf.h"
 #include "onvm_stats.h"
 
 /****************************Internal Declarations****************************/
@@ -64,6 +66,8 @@ static uint8_t main_keep_running = 1;
 // We'll want to shut down the TX/RX threads second so that we don't
 // race the stats display to be able to print, so keep this varable separate
 static uint8_t worker_keep_running = 1;
+static struct onvm_perf_stats g_queue_upf_lb_txq_to_mgr_wait_stats;
+static struct onvm_perf_stats g_queue_upf_u_txq_to_mgr_wait_stats;
 
 static void
 handle_signal(int sig);
@@ -239,6 +243,21 @@ tx_thread_main(void *arg) {
 
                         /* Now process the Client packets read */
                         if (likely(tx_count > 0)) {
+                                if (nf->tag != NULL && strcmp(nf->tag, "upf_lb") == 0) {
+                                        for (unsigned j = 0; j < tx_count; j++) {
+                                                onvm_perf_trace_record(&g_queue_upf_lb_txq_to_mgr_wait_stats,
+                                                                       "queue_upf_lb_txq_to_mgr_wait",
+                                                                       pkts[j],
+                                                                       onvm_config->perf_trace_dynfield_offset);
+                                        }
+                                } else if (nf->tag != NULL && strcmp(nf->tag, "upf_u") == 0) {
+                                        for (unsigned j = 0; j < tx_count; j++) {
+                                                onvm_perf_trace_record(&g_queue_upf_u_txq_to_mgr_wait_stats,
+                                                                       "queue_upf_u_txq_to_mgr_wait",
+                                                                       pkts[j],
+                                                                       onvm_config->perf_trace_dynfield_offset);
+                                        }
+                                }
                                 onvm_pkt_process_tx_batch(tx_mgr, pkts, onvm_config->dynfield_offset, tx_count, nf);
                         }
                 }

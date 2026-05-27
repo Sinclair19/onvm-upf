@@ -19,6 +19,7 @@
 #include <string.h>
 #include <rte_cycles.h>
 #include <rte_ethdev.h>
+#include <rte_ip.h>
 #include <rte_mempool.h>
 
 #include "upf_u_arp.h"
@@ -40,6 +41,27 @@ static struct neigh_entry neigh_tbl[NEIGH_MAX];
 
 /* ARP Reply mbuf pool */
 static struct rte_mempool *g_pktmbuf_pool = NULL;
+
+static int
+hardcoded_neigh(uint16_t port, uint32_t ip_be, struct rte_ether_addr *mac) {
+    if (port == g_n3_port && ip_be == rte_cpu_to_be_32(RTE_IPV4(192, 168, 2, 1))) {
+        static const struct rte_ether_addr gnb_mac = {
+            .addr_bytes = {0x16, 0xab, 0x96, 0x23, 0x75, 0x87}
+        };
+        rte_ether_addr_copy(&gnb_mac, mac);
+        return 1;
+    }
+
+    if (port == g_n6_port && ip_be == rte_cpu_to_be_32(RTE_IPV4(192, 168, 3, 2))) {
+        static const struct rte_ether_addr dn_mac = {
+            .addr_bytes = {0x2a, 0x8a, 0x25, 0x14, 0xaa, 0x04}
+        };
+        rte_ether_addr_copy(&dn_mac, mac);
+        return 1;
+    }
+
+    return 0;
+}
 
 /* Check if the given IP is one of our local IPs on the specified port */
 static int
@@ -76,6 +98,12 @@ neigh_lookup(uint16_t port, uint32_t ip_be) {
         }
 
         if (e->port_id == port && e->ip_be == ip_be) {
+            if (hardcoded_neigh(port, ip_be, &e->mac)) {
+                e->last_update_tsc = rte_get_tsc_cycles();
+                e->state = NEIGH_REACHABLE;
+                return e;
+            }
+
             /* Optional stale marking */
             uint64_t now = rte_get_tsc_cycles();
             uint64_t hz = rte_get_tsc_hz();
@@ -435,6 +463,20 @@ attach_l2_or_arp(struct rte_mbuf *pkt,
 
     ne = neigh_lookup(out_port, next_hop_ip_be);
     if (ne == NULL || ne->state != NEIGH_REACHABLE) {
+        struct rte_ether_addr hardcoded_mac;
+        if (hardcoded_neigh(out_port, next_hop_ip_be, &hardcoded_mac)) {
+            neigh_update(out_port, next_hop_ip_be, &hardcoded_mac);
+            ne = neigh_lookup(out_port, next_hop_ip_be);
+        }
+    }
+
+    if (ne == NULL || ne->state != NEIGH_REACHABLE) {
+        char local[16], next_hop[16];
+        UTLT_Warning("attach_l2_or_arp: unresolved neighbor port=%u local=%s next_hop=%s state=%u; sent/queued ARP request and dropped current packet",
+                     out_port,
+                     ipv4_to_buf(local_ip_be, local),
+                     ipv4_to_buf(next_hop_ip_be, next_hop),
+                     ne ? ne->state : NEIGH_EMPTY);
         (void)send_arp_request(out_port, local_ip_be, next_hop_ip_be, nf);
         return -1;
     }

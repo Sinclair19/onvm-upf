@@ -52,6 +52,7 @@
 
 #include <getopt.h>
 #include <signal.h>
+#include <string.h>
 
 /******************************DPDK libraries*********************************/
 #include "rte_malloc.h"
@@ -59,6 +60,7 @@
 /*****************************Internal headers********************************/
 
 #include "onvm_includes.h"
+#include "onvm_perf.h"
 #include "onvm_nflib.h"
 #include "onvm_sc_common.h"
 
@@ -106,6 +108,11 @@ struct onvm_service_chain *default_chain;
 
 /* Shared data for onvm config */
 struct onvm_configuration *onvm_config;
+
+static struct onvm_perf_stats g_upf_lb_perf_stats;
+static struct onvm_perf_stats g_upf_u_perf_stats;
+static struct onvm_perf_stats g_queue_mgr_to_upf_lb_rxq_wait_stats;
+static struct onvm_perf_stats g_queue_mgr_to_upf_u_rxq_wait_stats;
 
 /* Flag to check if shared core mutex sleep/wakeup is enabled */
 uint8_t ONVM_NF_SHARE_CORES;
@@ -1009,8 +1016,19 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
         uint16_t i, nb_pkts;
         struct packet_buf tx_buf;
         int ret_act;
+        struct onvm_perf_stats *perf_stats;
+        const char *perf_name;
 
         nf = nf_local_ctx->nf;
+        perf_stats = NULL;
+        perf_name = NULL;
+        if (nf->tag != NULL && strcmp(nf->tag, "upf_lb") == 0) {
+                perf_stats = &g_upf_lb_perf_stats;
+                perf_name = "upf_lb";
+        } else if (nf->tag != NULL && strcmp(nf->tag, "upf_u") == 0) {
+                perf_stats = &g_upf_u_perf_stats;
+                perf_name = "upf_u";
+        }
 
         /* Dequeue all packets in ring up to max possible. */
         nb_pkts = rte_ring_dequeue_burst(nf->rx_q, pkts, PACKET_READ_SIZE, NULL);
@@ -1023,8 +1041,24 @@ onvm_nflib_dequeue_packets(void **pkts, struct onvm_nf_local_ctx *nf_local_ctx, 
 
         /* Give each packet to the user proccessing function */
         for (i = 0; i < nb_pkts; i++) {
+                uint64_t perf_start = 0;
                 meta = onvm_get_pkt_meta((struct rte_mbuf *)pkts[i], pkt_meta_offset);
+                if (perf_stats == &g_upf_lb_perf_stats)
+                        onvm_perf_trace_record(&g_queue_mgr_to_upf_lb_rxq_wait_stats,
+                                               "queue_mgr_to_upf_lb_rxq_wait",
+                                               (struct rte_mbuf *)pkts[i],
+                                               onvm_config->perf_trace_dynfield_offset);
+                else if (perf_stats == &g_upf_u_perf_stats)
+                        onvm_perf_trace_record(&g_queue_mgr_to_upf_u_rxq_wait_stats,
+                                               "queue_mgr_to_upf_u_rxq_wait",
+                                               (struct rte_mbuf *)pkts[i],
+                                               onvm_config->perf_trace_dynfield_offset);
+
+                if (perf_stats != NULL)
+                        perf_start = onvm_perf_sample_begin(perf_stats, perf_name);
                 ret_act = (*handler)((struct rte_mbuf *)pkts[i], meta, nf_local_ctx);
+                if (perf_stats != NULL)
+                        onvm_perf_sample_end(perf_stats, perf_start);
                 /* NF returns 0 to return packets or 1 to buffer */
                 if (likely(ret_act == 0)) {
                         tx_buf.buffer[tx_buf.count++] = pkts[i];
