@@ -38,6 +38,7 @@ uint32_t trTCMidx = 0;
 struct rte_meter_trtcm_profile app_trtcm_profile;
 struct rte_meter_trtcm_profile app_flow_trtcm_profiles[APP_FLOWS_MAX];
 struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
+static bool app_flow_has_gbr[APP_FLOWS_MAX];
 
 static struct ue_hash_entry ue_hash[MAX_UE];
 struct ue_tb ue_table[MAX_UE];
@@ -68,6 +69,7 @@ trtcmConfigFlowTables(void) {
     // config flow meters with trtcm profiles
     for (i = 0; i < APP_FLOWS_MAX; i++){
         app_flow_trtcm_profiles[i] = app_trtcm_profile;
+        app_flow_has_gbr[i] = true;
         rtn = rte_meter_trtcm_config(&app_flows[i],
                                      &app_flow_trtcm_profiles[i]);
         if (rtn)
@@ -99,6 +101,8 @@ trtcmColorHandle(uint32_t pkt_len, uint64_t time, int flow_idx, struct rte_meter
         target_profile,
         time,
         pkt_len);
+    if (!app_flow_has_gbr[flow_idx] && out_color == RTE_COLOR_GREEN)
+        out_color = RTE_COLOR_YELLOW;
     return out_color;
 }
 
@@ -365,11 +369,12 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink) {
     UTLT_Info("QER ID: %u key: %u", qer->qerId, key);
 
     struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
+    bool has_gbr = qer->flags.guaranteedBitrate;
 
     uint32_t mbr = is_uplink ? qer->maximumBitrate.ul : qer->maximumBitrate.dl;
     trtcm_params.pir = mbr * 1000 / 8;
 
-    if (qer->flags.guaranteedBitrate) {
+    if (has_gbr) {
         uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
         trtcm_params.cir = gbr * 1000 / 8;
     } else {
@@ -388,6 +393,7 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink) {
         UTLT_Warning("TRTCM flow config failed for key %u: %d", key, rtn);
         return;
     }
+    app_flow_has_gbr[trTCMidx] = has_gbr;
 
     if (!ftAddEntry(key, trTCMidx)) {
         UTLT_Warning("FT add failed");
