@@ -957,6 +957,60 @@ build_dl_shaper_flow_key(struct rte_mbuf *pkt, const UPDK_PDR *pdr,
     return true;
 }
 
+static uint32_t
+dl_qos_packet_len(struct rte_mbuf *pkt, const struct rte_ipv4_hdr *iph) {
+    uint16_t ip_total_len;
+    uint16_t ip_hdr_len;
+    uint16_t l4_payload_len;
+    uint16_t l4_off;
+    uint32_t pkt_len;
+
+    if (pkt == NULL || iph == NULL)
+        return 0;
+
+    ip_hdr_len = (uint16_t)((iph->version_ihl & 0x0f) * 4);
+    ip_total_len = rte_be_to_cpu_16(iph->total_length);
+    pkt_len = rte_pktmbuf_pkt_len(pkt);
+
+    if (ip_hdr_len < sizeof(struct rte_ipv4_hdr) ||
+        ip_total_len < ip_hdr_len ||
+        pkt_len < sizeof(struct rte_ether_hdr) + ip_hdr_len)
+        return 0;
+
+    l4_payload_len = ip_total_len - ip_hdr_len;
+    l4_off = sizeof(struct rte_ether_hdr) + ip_hdr_len;
+
+    if (iph->next_proto_id == IPPROTO_UDP) {
+        if (l4_payload_len >= sizeof(struct rte_udp_hdr) &&
+            pkt_len >= l4_off + sizeof(struct rte_udp_hdr))
+            return l4_payload_len - sizeof(struct rte_udp_hdr);
+        return l4_payload_len;
+    }
+
+    if (iph->next_proto_id == IPPROTO_TCP) {
+        struct rte_tcp_hdr tcp_hdr;
+        const struct rte_tcp_hdr *th;
+        uint16_t tcp_hdr_len;
+
+        if (l4_payload_len < sizeof(struct rte_tcp_hdr) ||
+            pkt_len < l4_off + sizeof(struct rte_tcp_hdr))
+            return l4_payload_len;
+
+        th = rte_pktmbuf_read(pkt, l4_off, sizeof(tcp_hdr), &tcp_hdr);
+        if (th == NULL)
+            return l4_payload_len;
+
+        tcp_hdr_len = (uint16_t)((th->data_off >> 4) * 4);
+        if (tcp_hdr_len < sizeof(struct rte_tcp_hdr) ||
+            tcp_hdr_len > l4_payload_len)
+            return l4_payload_len;
+
+        return l4_payload_len - tcp_hdr_len;
+    }
+
+    return l4_payload_len;
+}
+
 static inline uint64_t
 saturating_add_u64(uint64_t lhs, uint64_t rhs) {
     return UINT64_MAX - lhs < rhs ? UINT64_MAX : lhs + rhs;
@@ -1319,7 +1373,6 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     uint32_t cal_pktlen = 0;
     UTLT_Trace("Get packet\n");
     UTLT_Info("Handle PKT from port: %d [len: %d]", pkt->port, pkt->pkt_len);
-    cal_pktlen = pkt->pkt_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
 
     bool is_dl = false;
     meta->action = ONVM_NF_ACTION_DROP;
@@ -1330,6 +1383,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         UTLT_Info("Not IP packet, ignore it\n");
         return 0;
     }
+    cal_pktlen = dl_qos_packet_len(pkt, iph);
 
     // Flip to a newly published snapshot if a REQ was received
     UpfClsMaybeFlipAndAck(nf_local_ctx);
