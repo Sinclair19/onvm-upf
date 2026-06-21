@@ -955,6 +955,11 @@ build_dl_shaper_flow_key(struct rte_mbuf *pkt, const UPDK_PDR *pdr,
     return true;
 }
 
+static inline uint64_t
+saturating_add_u64(uint64_t lhs, uint64_t rhs) {
+    return UINT64_MAX - lhs < rhs ? UINT64_MAX : lhs + rhs;
+}
+
 UPDK_PDR *
 GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 {
@@ -1071,6 +1076,7 @@ GetQerByUEIpAddressFromPdr(uint32_t ue_ip, const UPDK_PDR *pdr, const char *ip_s
     uint64_t ambr64 = 0;
     uint64_t gbr64  = 0;
     uint64_t mbr64  = 0;
+    bool has_gbr_qer = false;
 
     int n = (int)pdr->qer_count;
     if (n > 2) n = 2; /* safety; struct currently supports 2 */
@@ -1082,10 +1088,10 @@ GetQerByUEIpAddressFromPdr(uint32_t ue_ip, const UPDK_PDR *pdr, const char *ip_s
         if (q->flags.maximumBitrate && q->maximumBitrate.dl > ambr64)
             ambr64 = q->maximumBitrate.dl;
 
-        /* old behavior: only set gbr/mbr when both flags are present */
         if (q->flags.guaranteedBitrate && q->flags.maximumBitrate) {
-            gbr64 = q->guaranteedBitrate.dl;
-            mbr64 = q->maximumBitrate.dl;
+            has_gbr_qer = true;
+            gbr64 = saturating_add_u64(gbr64, q->guaranteedBitrate.dl);
+            mbr64 = saturating_add_u64(mbr64, q->maximumBitrate.dl);
         }
     }
 
@@ -1100,6 +1106,8 @@ GetQerByUEIpAddressFromPdr(uint32_t ue_ip, const UPDK_PDR *pdr, const char *ip_s
     uint32_t gbr  = (gbr64  > UINT32_MAX) ? UINT32_MAX : (uint32_t)gbr64;
     uint32_t mbr  = (mbr64  > UINT32_MAX) ? UINT32_MAX : (uint32_t)mbr64;
 
+    if (!has_gbr_qer)
+        mbr = 0;
     if (mbr && gbr > mbr) gbr = mbr;
 
     UTLT_Warning("Add UE IP: %s, AMBR: %u GBR: %u, MBR: %u",
