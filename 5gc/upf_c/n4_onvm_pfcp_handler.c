@@ -568,6 +568,9 @@ UpfPdrPrecompileSdf(UpfPDR *pdr, int access_port, int core_port, int sgi_port)
     pdr->has_fd   = 0;
     pdr->fd_target = 0;
     pdr->meter_key = 0;
+    pdr->has_fd_to = 0;
+    pdr->fd_to_net = 0;
+    pdr->fd_to_mask = 0;
 
     if (!pdr->pdi.flags.sdfFilter || !pdr->pdi.sdfFilter.flowDescription[0])
         return;
@@ -594,7 +597,7 @@ UpfPdrPrecompileSdf(UpfPDR *pdr, int access_port, int core_port, int sgi_port)
     sscanf(tmp, "%[^/]/%u", ip_str, &prefix_len);
     struct in_addr ip_addr;
     inet_pton(AF_INET, ip_str, &ip_addr);
-    uint32_t masked = ip_addr.s_addr & htonl(0xFFFFFFFFu << (32 - prefix_len));
+    uint32_t masked = ip_addr.s_addr & htonl(prefix_len == 0 ? 0u : (0xFFFFFFFFu << (32 - prefix_len)));
 
     pdr->fd_target = masked;
     pdr->has_fd    = 1;
@@ -609,8 +612,38 @@ UpfPdrPrecompileSdf(UpfPDR *pdr, int access_port, int core_port, int sgi_port)
     }
     pdr->meter_key = (uint32_t)base + masked;
 
+    // Precompute "to <IP/prefix>"
+    const char *to = strstr(fd, "to ");
+    if (to) {
+        to += 3; /* skip "to " */
+        const char *to_end = strchr(to, ' ');
+        size_t tn = to_end ? (size_t)(to_end - to) : strlen(to);
+        if (tn > 0 && tn < sizeof(tmp)) {
+            memcpy(tmp, to, tn);
+            tmp[tn] = '\0';
+
+            if (strcmp(tmp, "any") != 0 && strcmp(tmp, "assigned") != 0) {
+                char ip_str_to[INET_ADDRSTRLEN] = {0};
+                uint32_t prefix_to = 32;
+                if (sscanf(tmp, "%[^/]/%u", ip_str_to, &prefix_to) >= 1) {
+                    if (prefix_to > 32) prefix_to = 32;
+                    struct in_addr to_addr;
+                    if (inet_pton(AF_INET, ip_str_to, &to_addr) == 1) {
+                        uint32_t rule_ip_host = ntohl(to_addr.s_addr);
+                        uint32_t mask = (prefix_to == 0) ? 0u : (0xFFFFFFFFu << (32 - prefix_to));
+                        pdr->fd_to_mask = mask;
+                        pdr->fd_to_net  = (rule_ip_host & mask);
+                        pdr->has_fd_to  = 1;
+                    }
+                }
+            }
+        }
+    }
+
     UTLT_Debug("PrecompileSdf: fd='%s' fd_target=0x%08x meter_key=%u has_fd=%u",
               fd, masked, pdr->meter_key, pdr->has_fd);
+    UTLT_Debug("PrecompileULSdf: fd='%s' fd_to_net=0x%08x fd_to_mask=0x%08x has_fd_to=%u",
+              fd, pdr->fd_to_net, pdr->fd_to_mask, pdr->has_fd_to);
 }
 
 /* Pick the QER that carries QFI for GTP-U encapsulation.

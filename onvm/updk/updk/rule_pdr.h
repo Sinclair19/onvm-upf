@@ -269,6 +269,9 @@ typedef struct {
     uint32_t  meter_key;       /* SourceInterfaceToPort(srcIf) + fd_target, or just the port */
     uint32_t  fd_target;       /* masked IP from "from <IP/prefix>" in flowDescription */
     uint8_t   has_fd;          /* 1 if flowDescription contains a specific IP (not "any") */
+    uint32_t  fd_to_net;       /* masked IP (host order) from "to <IP/prefix>" */
+    uint32_t  fd_to_mask;      /* mask (host order) for fd_to_net */
+    uint8_t   has_fd_to;       /* 1 if flowDescription has a specific "to" IP/prefix */
 
     // handle multiple URR
     uint32_t urrId[4];

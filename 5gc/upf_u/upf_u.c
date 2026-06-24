@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +35,12 @@
 #include <rte_ether.h>
 #include <rte_mbuf.h>
 #include <rte_meter.h>
+#include <rte_malloc.h>
+#include <rte_mempool.h>
+#include <rte_ring.h>
+#include <rte_ring_peek.h>
+#include <rte_spinlock.h>
+#include <rte_tcp.h>
 
 #include "gtp.h"
 #include "upf_context.h"
@@ -54,43 +61,116 @@
 #include "upf_u_config.h"
 #include "upf_u_arp.h"
 #include "upf_u_icmp.h"
+#include "upf_u_trtcm.h"
 
 #define NF_TAG "upf_u"
-
-#define APP_FLOWS_MAX 256
-#define MAX_UE 256 // Max number of UEs
-#define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
 /* Used for buffering */
 #define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
 #define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
 
-enum { IF_UNKNOWN = -1 };
+/* Used for non-blocking UE token-bucket shaping */
+#define SHAPER_SCAN_BUDGET       32
+#define SHAPER_DRAIN_BUDGET      64
+#define SHAPER_CLASS_BURST        8
+#define SHAPER_MAX_FLOWS_PER_UE  64
+#define SHAPER_MAX_PKTS_PER_FLOW 256
+#define SHAPER_MAX_PKTS_PER_UE   1024
+#define SHAPER_ENTRY_POOL_CACHE  256
+#define SHAPER_UE_BITMAP_WORDS   ((MAX_UE + 63) / 64)
 
-struct rte_meter_trtcm_profile app_trtcm_profile;
-struct rte_meter_trtcm_profile app_flow_trtcm_profile;
-struct rte_meter_trtcm app_flows[APP_FLOWS_MAX];
+uint64_t seid = 0;
+uint16_t pdrId = 0;
 
-/* trTCM */
-struct rte_meter_trtcm_params app_trtcm_params = {
-	.cir = 125000,    // bytes per secs
-	.pir = 625000,    // bytes per secs
-	.cbs = 2048,
-	.pbs = 2048
+enum shaper_decision {
+    SHAPER_PASS = 0,
+    SHAPER_QUEUED,
+    SHAPER_DROP
 };
 
+enum shaper_pkt_color {
+    SHAPER_COLOR_NQOS = 0,
+    SHAPER_COLOR_GREEN,
+    SHAPER_COLOR_YELLOW
+};
 
-/* Flow Separation*/
-struct flow_entry {
-    uint32_t subnet;  // (Network & Mask_bits)
-    int flow_idx;     // maps to trTCM flows table
-    bool in_use;      // to track if the slot is occupied
-}typedef flow_entry_t;
+enum shaper_active_list_id {
+    SHAPER_ACTIVE_NONE = 0,
+    SHAPER_ACTIVE_GREEN,
+    SHAPER_ACTIVE_YELLOW,
+    SHAPER_ACTIVE_NQOS,
+    SHAPER_ACTIVE_COUNT
+};
 
-flow_entry_t iPFlows[APP_FLOWS_MAX];
-uint32_t iPFlowsLen = 0;
-uint32_t trTCMidx = 0;
+struct shaper_flow_key {
+    uint32_t ue_ip;
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t proto;
+    uint8_t qfi;
+    uint8_t is_qos;
+};
 
+struct shaper_entry {
+    struct rte_mbuf *pkt;
+    uint32_t pkt_len;
+    uint16_t destination;
+    enum shaper_pkt_color color;
+    struct shaper_entry *next;
+};
+
+struct shaper_flow {
+    bool in_use;
+    struct shaper_flow_key key;
+    struct shaper_entry *head;
+    struct shaper_entry *tail;
+    uint32_t queued_pkts;
+    uint32_t queued_bytes;
+    enum shaper_active_list_id active_list;
+    uint64_t last_active_tsc;
+    TAILQ_ENTRY(shaper_flow) active_node;
+};
+
+TAILQ_HEAD(shaper_flow_head, shaper_flow);
+
+struct ue_shaper {
+    rte_spinlock_t lock;
+    struct shaper_flow flows[SHAPER_MAX_FLOWS_PER_UE];
+    struct shaper_flow_head active[SHAPER_ACTIVE_COUNT];
+    uint32_t active_count[SHAPER_ACTIVE_COUNT];
+    uint32_t queued_pkts;
+    uint8_t next_excess_is_yellow;
+};
+
+static struct ue_shaper g_ue_shaper[MAX_UE];
+static struct rte_mempool *g_shaper_entry_pool;
+static uint64_t g_shaper_active_ue_bitmap[SHAPER_UE_BITMAP_WORDS];
+static uint32_t g_shaper_active_ue_cursor;
+static uint64_t g_shaper_queued;
+static uint64_t g_shaper_drained;
+static uint64_t g_shaper_drop_invalid;
+static uint64_t g_shaper_drop_red;
+static uint64_t g_shaper_drop_green_overflow;
+static uint64_t g_shaper_drop_yellow_overflow;
+static uint64_t g_shaper_drop_nqos_overflow;
+static uint64_t g_shaper_drop_flow_table_full;
+static uint64_t g_shaper_drop_flow_queue_full;
+static uint64_t g_shaper_drop_ue_queue_full;
+static uint64_t g_shaper_drop_mempool_empty;
+
+static inline int
+UpfSendEvt1(uint16_t dest_sid, uint32_t type, uintptr_t a0) {
+    Event *e = (Event *)rte_calloc("upf_evt", 1, sizeof(*e), 0);
+    if (!e) return -1;
+    e->type = (uintptr_t)type;
+    e->argc = 1;
+    e->arg0 = a0;
+    int rc = onvm_nflib_send_msg_to_nf(dest_sid, e);
+    if (rc < 0) rte_free(e);
+    return rc;
+}
 
 typedef struct {
     void    *ptr;          // current active snapshot (cls_handle_t*)
@@ -196,393 +276,686 @@ UpfClassifyGetPdrPtr(const ps_packet_t *key) {
     return (const UPDK_PDR *)descriptor;
 }
 
-bool
-ftAddEntry(uint32_t subnet, int flow_idx) {
-    if (iPFlowsLen >= APP_FLOWS_MAX) {
-        printf("Error: Maximum flow entries reached.\n");
-        return false;
+static int
+shaper_init_entry_pool(struct onvm_nf *nf) {
+    char name[64];
+    uint64_t entry_count64 = (uint64_t)MAX_UE * SHAPER_MAX_PKTS_PER_UE;
+    unsigned int entry_count;
+    uint16_t instance_id = nf ? nf->instance_id : 0;
+
+    if (g_shaper_entry_pool != NULL)
+        return 0;
+
+    if (entry_count64 == 0 || entry_count64 > UINT_MAX) {
+        UTLT_Error("Invalid shaper entry pool size: %" PRIu64,
+                   entry_count64);
+        return -1;
     }
+    entry_count = (unsigned int)entry_count64;
 
-    if (ftSearch(subnet) != -1) {
-        printf("Error: Subnet %u already exists.\n", subnet);
-        return false;
+    snprintf(name, sizeof(name), "us_entry_%03u", instance_id);
+    g_shaper_entry_pool = rte_mempool_lookup(name);
+    if (g_shaper_entry_pool != NULL)
+        return 0;
+
+    g_shaper_entry_pool = rte_mempool_create(name, entry_count,
+                                             sizeof(struct shaper_entry),
+                                             SHAPER_ENTRY_POOL_CACHE, 0,
+                                             NULL, NULL, NULL, NULL,
+                                             SOCKET_ID_ANY, 0);
+    if (g_shaper_entry_pool == NULL)
+        g_shaper_entry_pool = rte_mempool_lookup(name);
+    if (g_shaper_entry_pool == NULL) {
+        UTLT_Error("Failed to create shaper entry pool %s", name);
+        return -1;
     }
-
-    int index = hashFunc(subnet);
-    while (iPFlows[index].in_use) {         // Linear Probing
-        index = (index + 1) % APP_FLOWS_MAX;
-    }
-
-    // Insert the entry
-    iPFlows[index].subnet = subnet;
-    iPFlows[index].flow_idx = flow_idx;
-    iPFlows[index].in_use = true;
-    iPFlowsLen++;
-
-    return true;
+    return 0;
 }
 
-static inline uint16_t
-SourceInterfaceToPort(source_interface_t srcIf) {
-    switch (srcIf) {
-      case SRC_IF_ACCESS:   return g_n3_port;
-      case SRC_IF_CORE:     return g_n6_port;
-      case SRC_IF_SGI_LAN:  return g_sgi_port;
-      case SRC_IF_CP_FUNC:
-      case SRC_IF_LI_FUNC:
-      default:
-        return IF_UNKNOWN;
+static void
+shaper_init_state(void) {
+    for (uint32_t word_idx = 0; word_idx < SHAPER_UE_BITMAP_WORDS; word_idx++)
+        __atomic_store_n(&g_shaper_active_ue_bitmap[word_idx], 0,
+                         __ATOMIC_RELEASE);
+    g_shaper_active_ue_cursor = 0;
+
+    for (int ue_idx = 0; ue_idx < MAX_UE; ue_idx++) {
+        rte_spinlock_init(&g_ue_shaper[ue_idx].lock);
+        for (int list_id = 0; list_id < SHAPER_ACTIVE_COUNT; list_id++)
+            TAILQ_INIT(&g_ue_shaper[ue_idx].active[list_id]);
+        g_ue_shaper[ue_idx].next_excess_is_yellow = 1;
     }
 }
 
 static inline void
-ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink)
-{
-    /* pdr->qer is the QFI-bearing (per-flow) QER selected by CP.
-     * It carries the correct MBR/GBR for flow-level trTCM metering. */
-    const UPDK_QER *qer = pdr ? pdr->qer : NULL;
-    if (!qer || !qer->flags.maximumBitrate) return;
-
-    bool has_fd = pdr->has_fd;
-
-    /* Use the same key that the DL policing path uses for ftSearch().
-     * pdr->meter_key was precomputed by UPF-C from the same port mapping,
-     * so insert and lookup are always consistent. */
-    uint32_t key = has_fd ? pdr->meter_key
-                          : (uint32_t)SourceInterfaceToPort(pdr->pdi.sourceInterface);
-
-    /* Only add on first miss — subsequent packets for the same key are a no-op */
-    if (ftSearch(key) >= 0) return;
-
-    UTLT_Info("QER ID: %u key: %u", qer->qerId, key);
-
-    struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
-
-    uint32_t mbr = is_uplink ? qer->maximumBitrate.ul : qer->maximumBitrate.dl;
-    trtcm_params.pir = mbr * 1000 / 8;
-
-    if (qer->flags.guaranteedBitrate) {
-        uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
-        trtcm_params.cir = gbr * 1000 / 8;
-    } else {
-        trtcm_params.cir = is_uplink ? 0 : 1;
-    }
-
-    if (!ftAddEntry(key, trTCMidx)) {
-        UTLT_Warning("FT add failed");
-    }
-    UTLT_Info("Successfully add %u(%d) %u", key, hashFunc(key), trTCMidx);
-
-    // Match config profile to what color-check later uses:
-    // DL + SDF present → app_flow_trtcm_profile; else app_trtcm_profile
-    if (!is_uplink && has_fd) {
-        rte_meter_trtcm_profile_config(&app_flow_trtcm_profile, &trtcm_params);
-        rte_meter_trtcm_config(&app_flows[trTCMidx], &app_flow_trtcm_profile);
-    } else {
-        rte_meter_trtcm_profile_config(&app_trtcm_profile, &trtcm_params);
-        rte_meter_trtcm_config(&app_flows[trTCMidx], &app_trtcm_profile);
-    }
-
-    if (is_uplink) {
-        UTLT_Info("Find MBR (UL: %lu) in QERs", qer->maximumBitrate.ul);
-        if (qer->flags.guaranteedBitrate)
-            UTLT_Info("Find GBR (UL: %lu) in QERs", qer->guaranteedBitrate.ul);
-    } else {
-        UTLT_Info("Find MBR (DL: %lu) in QERs", qer->maximumBitrate.dl);
-        if (qer->flags.guaranteedBitrate)
-            UTLT_Info("Find GBR (DL: %lu) in QERs", qer->guaranteedBitrate.dl);
-    }
-
-    UTLT_Info("TRTCM params: %d %d %d %d\n",
-              trtcm_params.cir, trtcm_params.pir,
-              trtcm_params.cbs, trtcm_params.pbs);
-
-    trTCMidx++;
+shaper_free_entry(struct shaper_entry *entry) {
+    if (entry != NULL && g_shaper_entry_pool != NULL)
+        rte_mempool_put(g_shaper_entry_pool, entry);
 }
 
-// static inline source_interface_t
-// PortToSourceInterface(uint16_t port) {
-//     if (port == g_n3_port)  return SRC_IF_ACCESS;
-//     if (port == g_n6_port)    return SRC_IF_CORE;
-//     if (port == g_sgi_port)     return SRC_IF_SGI_LAN;
-//     UTLT_Warning("PortToSourceInterface: unknown port %" PRIu16
-//              " (N3=%" PRIu16 " N6=%" PRIu16 " SGI=%" PRIu16
-//              ") — defaulting to ACCESS",
-//              port, g_n3_port, g_n6_port, g_sgi_port);
+static inline uint64_t
+shaper_ue_bitmap_valid_mask(uint32_t word_idx) {
+    uint32_t used_bits;
 
-//     return SRC_IF_ACCESS;
-// }
+    if (word_idx + 1 < SHAPER_UE_BITMAP_WORDS)
+        return UINT64_MAX;
+
+    used_bits = MAX_UE & 63;
+    return used_bits == 0 ? UINT64_MAX : ((1ULL << used_bits) - 1);
+}
+
+static inline void
+shaper_mark_ue_active(int ue_idx) {
+    uint32_t word_idx = (uint32_t)ue_idx / 64;
+    uint64_t bit = 1ULL << ((uint32_t)ue_idx & 63);
+
+    __atomic_fetch_or(&g_shaper_active_ue_bitmap[word_idx], bit,
+                      __ATOMIC_RELEASE);
+}
+
+static inline void
+shaper_clear_ue_active(int ue_idx) {
+    uint32_t word_idx = (uint32_t)ue_idx / 64;
+    uint64_t bit = 1ULL << ((uint32_t)ue_idx & 63);
+
+    __atomic_fetch_and(&g_shaper_active_ue_bitmap[word_idx], ~bit,
+                       __ATOMIC_RELEASE);
+}
 
 static int
-trtcmConfigFlowTables(void){
-    uint32_t i;
-    int rtn;
-    if (likely(app_flows[0].tc > 0))
-        return 0;
-    
-    // config trtcm profile
-    rtn = rte_meter_trtcm_profile_config(&app_trtcm_profile,
-		&app_trtcm_params);
-	if (rtn)
-		return rtn;
-        
-    // config flow meters with trtcm profiles
-    for (i=0; i<APP_FLOWS_MAX; i++){
-        rtn = rte_meter_trtcm_config(&app_flows[i], &app_trtcm_profile);
-        if (rtn)
-            return rtn;
-    }
+shaper_next_active_ue(const uint64_t *skip_bitmap) {
+    uint32_t start = g_shaper_active_ue_cursor % MAX_UE;
+    uint32_t start_word = start / 64;
+    uint32_t start_bit = start & 63;
 
-    UTLT_Info("Flow table configured.");
-    return 0;
-}
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        uint32_t first_word = pass == 0 ? start_word : 0;
+        uint32_t last_word = pass == 0 ? SHAPER_UE_BITMAP_WORDS
+                                       : start_word + 1;
 
-static inline int
-trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_trtcm_profile *target_profile){
-    uint8_t out_color = 0;
-    // check configured flow
-    if (unlikely(app_trtcm_profile.cir_period == 0)){
-        UTLT_Info("flow cir_period set err");
-        return -1;
-    }
-    if (unlikely(app_trtcm_profile.pir_period == 0)) {
-        UTLT_Info("flow pir_period set err");    
-        return -1;
-    }
-    out_color = (uint8_t) rte_meter_trtcm_color_blind_check(&app_flows[qfi], 
-        target_profile, 
-        time, 
-        pkt_len);
-    return out_color;
-}
+        for (uint32_t word_idx = first_word; word_idx < last_word; word_idx++) {
+            uint64_t word = __atomic_load_n(&g_shaper_active_ue_bitmap[word_idx],
+                                            __ATOMIC_ACQUIRE);
+            word &= shaper_ue_bitmap_valid_mask(word_idx);
+            if (skip_bitmap != NULL)
+                word &= ~skip_bitmap[word_idx];
+            if (pass == 0 && word_idx == start_word) {
+                if (start_bit > 0)
+                    word &= UINT64_MAX << start_bit;
+            } else if (pass == 1 && word_idx == start_word) {
+                if (start_bit == 0)
+                    word = 0;
+                else
+                    word &= (1ULL << start_bit) - 1;
+            }
+            if (word == 0)
+                continue;
 
-static inline int
-trtcmPolicer(struct onvm_pkt_meta *meta, int color_result){
-    if (meta->action == ONVM_NF_ACTION_DROP) {
-        meta->flags = RTE_COLOR_RED;
-        UTLT_Info("TB not enough & traffic flow");
-        return 0;
-    }
-    switch (color_result){
-    case RTE_COLOR_RED:
-        UTLT_Info("\033[0;31mRED(%d)\033[0m, drop pkt", RTE_COLOR_RED);
-        meta->flags = RTE_COLOR_RED;
-        meta->action = ONVM_NF_ACTION_DROP;
-        break;
-    case RTE_COLOR_YELLOW:
-        UTLT_Info("\033[0;32mYELLOW(%d)\033[0m, best effort pkt fwd", RTE_COLOR_YELLOW);
-        meta->flags = RTE_COLOR_YELLOW;
-        meta->action = ONVM_NF_ACTION_DROP;
-        break;
-    case RTE_COLOR_GREEN:
-        UTLT_Info("\033[0;33mGREEEN(%d)\033[0m, guaranted pkt fwd.", RTE_COLOR_GREEN);
-        meta->flags = RTE_COLOR_GREEN;
-        meta->action = ONVM_NF_ACTION_OUT;
-        break;
-    default:
-        UTLT_Error("Unexpected trTCM color output.");
-        return 1;
-    }
-    return 0;
-}
-
-
-int hashFunc(uint32_t subnet) {
-    return subnet % APP_FLOWS_MAX;
-}
-
-int ftSearch(uint32_t subnet) {
-    int index = hashFunc(subnet);
-    int original_index = index;
-
-    while (iPFlows[index].in_use) {
-        if (iPFlows[index].subnet == subnet) {
-            return iPFlows[index].flow_idx;
-        }
-        index = (index + 1) % APP_FLOWS_MAX;  // Linear Probing
-        
-        if (index == original_index) {
-            break;
+            uint32_t bit = (uint32_t)__builtin_ctzll(word);
+            uint32_t ue_idx = word_idx * 64 + bit;
+            g_shaper_active_ue_cursor = (ue_idx + 1) % MAX_UE;
+            return (int)ue_idx;
         }
     }
 
-    return -1;  // Not found
-}
-
-// void ftInit() {
-//     for (int i = 0; i < APP_FLOWS_MAX; i++) {
-//         iPFlows[i].in_use = false;
-//     }
-// }
-
-/* Token Bucket */
-struct tb_config {
-    uint64_t tb_rate;    // rate at which tokens are generated (in MBps)
-    uint64_t tb_depth;   // depth of the token bucket (in bytes)
-    uint64_t tb_tokens;  // number of the tokens in the bucket at any given time (in bytes)
-    uint64_t last_cycle;
-    uint64_t cur_cycles;
-    uint16_t used;
-};
-
-struct ue_tb {
-    uint32_t ue_ip;
-    uint32_t ue_ambr;
-    uint32_t ue_gbr;
-    uint32_t ue_mbr;
-    struct tb_config ue_nqos_tb_params;
-    struct tb_config ue_qos_tb_params;
-};
-
-struct ue_tb ue_table[MAX_UE];
-
-void 
-initUeTable(){
-    for (int i = 0; i < MAX_UE; i++) {
-        ue_table[i].ue_ip = 0;
-        ue_table[i].ue_ambr = 0;
-        ue_table[i].ue_gbr = 0;
-        ue_table[i].ue_mbr = 0;
-
-        ue_table[i].ue_nqos_tb_params.tb_rate = 0;
-        ue_table[i].ue_nqos_tb_params.tb_depth = 0;
-        ue_table[i].ue_nqos_tb_params.tb_tokens = 0;
-        ue_table[i].ue_nqos_tb_params.last_cycle = rte_get_tsc_cycles();
-        ue_table[i].ue_nqos_tb_params.cur_cycles = rte_get_tsc_cycles();
-
-        ue_table[i].ue_qos_tb_params.tb_rate = 0;
-        ue_table[i].ue_qos_tb_params.tb_depth = 0;
-        ue_table[i].ue_qos_tb_params.tb_tokens = 0;
-        ue_table[i].ue_qos_tb_params.last_cycle = rte_get_tsc_cycles();
-        ue_table[i].ue_qos_tb_params.cur_cycles = rte_get_tsc_cycles();
-    }
-}
-
-/* ── UE-IP → ue_table index hash (O(1) avg, replaces linear scan) ── */
-struct ue_hash_entry {
-    uint32_t ue_ip;
-    int      ue_idx;   /* index into ue_table[] */
-    bool     in_use;
-};
-static struct ue_hash_entry ue_hash[MAX_UE];
-
-static inline int ueHashFunc(uint32_t ip) { return ip % MAX_UE; }
-
-static void ueHashInit(void) {
-    for (int i = 0; i < MAX_UE; i++)
-        ue_hash[i].in_use = false;
-}
-
-/* Return ue_table index, or -1 */
-static inline int ueHashSearch(uint32_t ue_ip) {
-    int idx = ueHashFunc(ue_ip);
-    int start = idx;
-    while (ue_hash[idx].in_use) {
-        if (ue_hash[idx].ue_ip == ue_ip)
-            return ue_hash[idx].ue_idx;
-        idx = (idx + 1) % MAX_UE;
-        if (idx == start) break;
-    }
     return -1;
 }
 
-static inline bool ueHashInsert(uint32_t ue_ip, int ue_idx) {
-    if (ueHashSearch(ue_ip) >= 0) return false; /* already present */
-    int idx = ueHashFunc(ue_ip);
-    while (ue_hash[idx].in_use)
-        idx = (idx + 1) % MAX_UE;
-    ue_hash[idx].ue_ip  = ue_ip;
-    ue_hash[idx].ue_idx = ue_idx;
-    ue_hash[idx].in_use = true;
-    return true;
+static inline bool
+shaper_flow_key_equal(const struct shaper_flow_key *a,
+                      const struct shaper_flow_key *b) {
+    return a->ue_ip == b->ue_ip &&
+           a->src_ip == b->src_ip &&
+           a->dst_ip == b->dst_ip &&
+           a->src_port == b->src_port &&
+           a->dst_port == b->dst_port &&
+           a->proto == b->proto &&
+           a->qfi == b->qfi &&
+           a->is_qos == b->is_qos;
 }
 
-/* Legacy wrapper — now O(1) via hash */
-uint32_t 
-findIndexByUeIpAddress(uint32_t ue_ip) {
-    return ueHashSearch(ue_ip);
+static inline uint32_t
+shaper_flow_hash(const struct shaper_flow_key *key) {
+    uint32_t h = 2166136261u;
+
+    h = (h ^ key->ue_ip) * 16777619u;
+    h = (h ^ key->src_ip) * 16777619u;
+    h = (h ^ key->dst_ip) * 16777619u;
+    h = (h ^ (((uint32_t)key->src_port << 16) | key->dst_port)) * 16777619u;
+    h = (h ^ (((uint32_t)key->proto << 16) |
+              ((uint32_t)key->qfi << 8) | key->is_qos)) * 16777619u;
+    return h;
 }
 
-int
-addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr, uint32_t ue_mbr) {
-    for (int i = 0; i < MAX_UE; i++) {
-        if (ue_table[i].ue_ip == 0) { // find unused
-            ue_table[i].ue_ip = ue_ip;
-            ue_table[i].ue_ambr = ue_ambr;
-            ue_table[i].ue_gbr = ue_gbr;
+static struct shaper_flow *
+shaper_lookup_flow(struct ue_shaper *ue, const struct shaper_flow_key *key,
+                   bool create) {
+    uint32_t start = shaper_flow_hash(key) % SHAPER_MAX_FLOWS_PER_UE;
+    int free_idx = -1;
 
-            uint32_t qos_rate = MIN((ue_gbr + (ue_ambr - ue_gbr) / 2), ue_mbr);
+    for (uint32_t probe = 0; probe < SHAPER_MAX_FLOWS_PER_UE; probe++) {
+        uint32_t idx = (start + probe) % SHAPER_MAX_FLOWS_PER_UE;
+        struct shaper_flow *flow = &ue->flows[idx];
 
-            ue_table[i].ue_qos_tb_params.tb_rate = qos_rate / 1000;
-            ue_table[i].ue_qos_tb_params.tb_depth = qos_rate;
-            ue_table[i].ue_qos_tb_params.tb_tokens = qos_rate;
-            ue_table[i].ue_qos_tb_params.last_cycle = rte_get_tsc_cycles();
-            ue_table[i].ue_qos_tb_params.cur_cycles = rte_get_tsc_cycles();
-            UTLT_Info("QoS Rate: %d", qos_rate);
-
-            uint32_t nqos_rate = ue_ambr - qos_rate;
-
-            ue_table[i].ue_nqos_tb_params.tb_rate = nqos_rate / 1000;
-            ue_table[i].ue_nqos_tb_params.tb_depth = nqos_rate;
-            ue_table[i].ue_nqos_tb_params.tb_tokens = nqos_rate;
-            ue_table[i].ue_nqos_tb_params.last_cycle = rte_get_tsc_cycles();
-            ue_table[i].ue_nqos_tb_params.cur_cycles = rte_get_tsc_cycles();
-            UTLT_Info("non QoS Rate: %d", nqos_rate);
-
-            ueHashInsert(ue_ip, i);
-            return i;  // Return the allocated index
+        if (flow->in_use) {
+            if (shaper_flow_key_equal(&flow->key, key))
+                return flow;
+            continue;
         }
+        if (free_idx < 0)
+            free_idx = (int)idx;
     }
-    return -1;  // Table full
+
+    if (!create || free_idx < 0)
+        return NULL;
+
+    struct shaper_flow *flow = &ue->flows[free_idx];
+    memset(flow, 0, sizeof(*flow));
+    flow->in_use = true;
+    flow->key = *key;
+    flow->active_list = SHAPER_ACTIVE_NONE;
+    return flow;
 }
 
-void 
-updateTokenbyIndex(int index) {
-    if (index > -1) {
-        uint64_t cur_cycles;
-        uint64_t elapsed_cycles;
-        uint64_t tokens_produced;
-
-        cur_cycles = rte_get_tsc_cycles();
-        elapsed_cycles = cur_cycles - ue_table[index].ue_nqos_tb_params.last_cycle;
-
-        tokens_produced = (elapsed_cycles * ue_table[index].ue_nqos_tb_params.tb_rate * 125000) / rte_get_tsc_hz();
-        ue_table[index].ue_nqos_tb_params.tb_tokens += tokens_produced;
-        if (ue_table[index].ue_nqos_tb_params.tb_tokens > ue_table[index].ue_nqos_tb_params.tb_depth)
-            ue_table[index].ue_nqos_tb_params.tb_tokens = ue_table[index].ue_nqos_tb_params.tb_depth;
-        ue_table[index].ue_nqos_tb_params.last_cycle = cur_cycles;
-
-        elapsed_cycles = cur_cycles - ue_table[index].ue_qos_tb_params.last_cycle;
-        tokens_produced = (elapsed_cycles * ue_table[index].ue_qos_tb_params.tb_rate * 125000) / rte_get_tsc_hz();
-        ue_table[index].ue_qos_tb_params.tb_tokens += tokens_produced;
-        if (ue_table[index].ue_qos_tb_params.tb_tokens > ue_table[index].ue_qos_tb_params.tb_depth)
-            ue_table[index].ue_qos_tb_params.tb_tokens = ue_table[index].ue_qos_tb_params.tb_depth;
-        ue_table[index].ue_qos_tb_params.last_cycle = cur_cycles;
-
-        return;
+static inline enum shaper_active_list_id
+shaper_active_list_for_head(const struct shaper_flow *flow) {
+    if (flow == NULL || flow->head == NULL)
+        return SHAPER_ACTIVE_NONE;
+    if (!flow->key.is_qos)
+        return SHAPER_ACTIVE_NQOS;
+    switch (flow->head->color) {
+    case SHAPER_COLOR_GREEN:
+        return SHAPER_ACTIVE_GREEN;
+    case SHAPER_COLOR_YELLOW:
+        return SHAPER_ACTIVE_YELLOW;
+    default:
+        return SHAPER_ACTIVE_NONE;
     }
-    UTLT_Error("UE IP not found in the table");
-    return;
+}
+
+static inline void
+shaper_activate_flow(struct ue_shaper *ue, struct shaper_flow *flow) {
+    enum shaper_active_list_id list_id = shaper_active_list_for_head(flow);
+
+    if (list_id == SHAPER_ACTIVE_NONE)
+        return;
+
+    if (flow->active_list != SHAPER_ACTIVE_NONE) {
+        TAILQ_REMOVE(&ue->active[flow->active_list], flow, active_node);
+        ue->active_count[flow->active_list]--;
+    }
+    TAILQ_INSERT_TAIL(&ue->active[list_id], flow, active_node);
+    ue->active_count[list_id]++;
+    flow->active_list = list_id;
+    flow->last_active_tsc = rte_get_tsc_cycles();
+}
+
+static inline void
+shaper_deactivate_flow(struct ue_shaper *ue, struct shaper_flow *flow) {
+    if (flow->active_list == SHAPER_ACTIVE_NONE)
+        return;
+    TAILQ_REMOVE(&ue->active[flow->active_list], flow, active_node);
+    ue->active_count[flow->active_list]--;
+    flow->active_list = SHAPER_ACTIVE_NONE;
+}
+
+static inline void
+shaper_release_empty_flow(struct ue_shaper *ue, struct shaper_flow *flow) {
+    shaper_deactivate_flow(ue, flow);
+    memset(flow, 0, sizeof(*flow));
+}
+
+static inline void
+shaper_count_overflow(enum shaper_pkt_color color) {
+    if (color == SHAPER_COLOR_GREEN)
+        __atomic_fetch_add(&g_shaper_drop_green_overflow, 1, __ATOMIC_RELAXED);
+    else if (color == SHAPER_COLOR_YELLOW)
+        __atomic_fetch_add(&g_shaper_drop_yellow_overflow, 1, __ATOMIC_RELAXED);
+    else
+        __atomic_fetch_add(&g_shaper_drop_nqos_overflow, 1, __ATOMIC_RELAXED);
 }
 
 static inline bool
-consumeUeBucketTokens(int index, bool is_qos, uint32_t pkt_len) {
-    if (unlikely(index < 0))
+shaper_class_has_backlog_locked(const struct ue_shaper *ue,
+                                enum ue_bucket_class bucket_class) {
+    switch (bucket_class) {
+    case UE_BUCKET_GREEN:
+        return ue->active_count[SHAPER_ACTIVE_GREEN] > 0;
+    case UE_BUCKET_YELLOW:
+    case UE_BUCKET_NQOS:
+        return ue->active_count[SHAPER_ACTIVE_GREEN] > 0 ||
+               ue->active_count[SHAPER_ACTIVE_YELLOW] > 0 ||
+               ue->active_count[SHAPER_ACTIVE_NQOS] > 0;
+    default:
         return false;
-
-    updateTokenbyIndex(index);
-
-    struct tb_config *tb = is_qos ? &ue_table[index].ue_qos_tb_params
-                                  : &ue_table[index].ue_nqos_tb_params;
-    if (tb->tb_tokens < pkt_len)
-        return false;
-
-    tb->tb_tokens -= pkt_len;
-    return true;
+    }
 }
 
-uint64_t seid = 0;
-uint16_t pdrId = 0;
+static inline enum ue_bucket_class
+shaper_bucket_for_packet(bool is_qos, enum shaper_pkt_color color) {
+    if (!is_qos)
+        return UE_BUCKET_NQOS;
+    if (color == SHAPER_COLOR_GREEN)
+        return UE_BUCKET_GREEN;
+    if (color == SHAPER_COLOR_YELLOW)
+        return UE_BUCKET_YELLOW;
+    return UE_BUCKET_NQOS;
+}
+
+static enum shaper_decision
+shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
+                        bool is_qos, enum shaper_pkt_color color,
+                        struct rte_mbuf *pkt, uint32_t pkt_len,
+                        struct onvm_pkt_meta *meta) {
+    struct ue_shaper *ue;
+    struct shaper_flow *flow;
+    struct shaper_entry *entry;
+    enum ue_bucket_class bucket_class =
+        shaper_bucket_for_packet(is_qos, color);
+
+    if (!ueBucketCanFitPacket(ue_idx, bucket_class, pkt_len)) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        __atomic_fetch_add(&g_shaper_drop_invalid, 1, __ATOMIC_RELAXED);
+        return SHAPER_DROP;
+    }
+    if (unlikely(pkt == NULL || key == NULL || g_shaper_entry_pool == NULL)) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        shaper_count_overflow(color);
+        return SHAPER_DROP;
+    }
+
+    ue = &g_ue_shaper[ue_idx];
+    rte_spinlock_lock(&ue->lock);
+
+    flow = shaper_lookup_flow(ue, key, false);
+    if (flow == NULL &&
+        !shaper_class_has_backlog_locked(ue, bucket_class) &&
+        consumeUeBucketTokens(ue_idx, bucket_class, pkt_len)) {
+        rte_spinlock_unlock(&ue->lock);
+        return SHAPER_PASS;
+    }
+
+    if (flow == NULL)
+        flow = shaper_lookup_flow(ue, key, true);
+    if (flow == NULL) {
+        rte_spinlock_unlock(&ue->lock);
+        meta->action = ONVM_NF_ACTION_DROP;
+        __atomic_fetch_add(&g_shaper_drop_flow_table_full, 1,
+                           __ATOMIC_RELAXED);
+        shaper_count_overflow(color);
+        return SHAPER_DROP;
+    }
+    if (flow->queued_pkts >= SHAPER_MAX_PKTS_PER_FLOW) {
+        rte_spinlock_unlock(&ue->lock);
+        meta->action = ONVM_NF_ACTION_DROP;
+        __atomic_fetch_add(&g_shaper_drop_flow_queue_full, 1,
+                           __ATOMIC_RELAXED);
+        shaper_count_overflow(color);
+        return SHAPER_DROP;
+    }
+    if (ue->queued_pkts >= SHAPER_MAX_PKTS_PER_UE) {
+        rte_spinlock_unlock(&ue->lock);
+        meta->action = ONVM_NF_ACTION_DROP;
+        __atomic_fetch_add(&g_shaper_drop_ue_queue_full, 1,
+                           __ATOMIC_RELAXED);
+        shaper_count_overflow(color);
+        return SHAPER_DROP;
+    }
+    if (rte_mempool_get(g_shaper_entry_pool, (void **)&entry) != 0) {
+        rte_spinlock_unlock(&ue->lock);
+        meta->action = ONVM_NF_ACTION_DROP;
+        __atomic_fetch_add(&g_shaper_drop_mempool_empty, 1,
+                           __ATOMIC_RELAXED);
+        shaper_count_overflow(color);
+        return SHAPER_DROP;
+    }
+
+    entry->pkt = pkt;
+    entry->pkt_len = pkt_len;
+    entry->destination = meta->destination;
+    entry->color = color;
+    entry->next = NULL;
+
+    rte_mbuf_refcnt_update(pkt, 1);
+    if (flow->tail != NULL)
+        flow->tail->next = entry;
+    else
+        flow->head = entry;
+    flow->tail = entry;
+    flow->queued_pkts++;
+    flow->queued_bytes += pkt_len;
+    ue->queued_pkts++;
+
+    if (flow->queued_pkts == 1)
+        shaper_activate_flow(ue, flow);
+    shaper_mark_ue_active(ue_idx);
+
+    rte_spinlock_unlock(&ue->lock);
+
+    __atomic_fetch_add(&g_shaper_queued, 1, __ATOMIC_RELAXED);
+    meta->action = ONVM_NF_ACTION_DROP;
+    return SHAPER_QUEUED;
+}
+
+static bool
+shaper_drain_one_from_list_locked(int ue_idx,
+                                  enum shaper_active_list_id list_id,
+                                  enum ue_bucket_class bucket_class,
+                                  struct rte_mbuf **tx_buf,
+                                  uint32_t *nb_tx,
+                                  struct onvm_configuration *onvm_config) {
+    struct ue_shaper *ue = &g_ue_shaper[ue_idx];
+    uint32_t attempts = ue->active_count[list_id];
+
+    while (attempts-- > 0) {
+        struct shaper_flow *flow = TAILQ_FIRST(&ue->active[list_id]);
+        struct shaper_entry *entry;
+        struct rte_mbuf *pkt;
+
+        if (flow == NULL)
+            return false;
+
+        shaper_deactivate_flow(ue, flow);
+        entry = flow->head;
+        if (entry == NULL) {
+            shaper_release_empty_flow(ue, flow);
+            continue;
+        }
+
+        if (!ueBucketCanFitPacket(ue_idx, bucket_class, entry->pkt_len)) {
+            flow->head = entry->next;
+            if (flow->head == NULL)
+                flow->tail = NULL;
+            flow->queued_pkts--;
+            flow->queued_bytes -= entry->pkt_len;
+            ue->queued_pkts--;
+            rte_pktmbuf_free(entry->pkt);
+            shaper_free_entry(entry);
+            __atomic_fetch_add(&g_shaper_drop_invalid, 1, __ATOMIC_RELAXED);
+            if (flow->head != NULL)
+                shaper_activate_flow(ue, flow);
+            else
+                shaper_release_empty_flow(ue, flow);
+            continue;
+        }
+
+        if (!consumeUeBucketTokens(ue_idx, bucket_class, entry->pkt_len)) {
+            shaper_activate_flow(ue, flow);
+            continue;
+        }
+
+        flow->head = entry->next;
+        if (flow->head == NULL)
+            flow->tail = NULL;
+        flow->queued_pkts--;
+        flow->queued_bytes -= entry->pkt_len;
+        ue->queued_pkts--;
+
+        pkt = entry->pkt;
+        struct onvm_pkt_meta *m =
+            onvm_get_pkt_meta(pkt, onvm_config->dynfield_offset);
+        m->action = ONVM_NF_ACTION_OUT;
+        m->destination = entry->destination;
+        tx_buf[(*nb_tx)++] = pkt;
+
+        shaper_free_entry(entry);
+        if (flow->head != NULL)
+            shaper_activate_flow(ue, flow);
+        else
+            shaper_release_empty_flow(ue, flow);
+
+        __atomic_fetch_add(&g_shaper_drained, 1, __ATOMIC_RELAXED);
+        return true;
+    }
+
+    return false;
+}
+
+static uint32_t
+shaper_drain_service_locked(int ue_idx,
+                            enum shaper_active_list_id list_id,
+                            enum ue_bucket_class bucket_class,
+                            struct rte_mbuf **tx_buf,
+                            uint32_t *nb_tx,
+                            struct onvm_configuration *onvm_config,
+                            uint32_t budget) {
+    uint32_t sent = 0;
+
+    while (sent < budget &&
+           g_ue_shaper[ue_idx].active_count[list_id] > 0) {
+        if (!shaper_drain_one_from_list_locked(ue_idx, list_id,
+                                               bucket_class, tx_buf, nb_tx,
+                                               onvm_config))
+            break;
+        sent++;
+    }
+
+    return sent;
+}
+
+static uint32_t
+shaper_drain_green_locked(int ue_idx, struct rte_mbuf **tx_buf,
+                          uint32_t *nb_tx,
+                          struct onvm_configuration *onvm_config,
+                          uint32_t budget) {
+    return shaper_drain_service_locked(ue_idx, SHAPER_ACTIVE_GREEN,
+                                       UE_BUCKET_GREEN, tx_buf, nb_tx,
+                                       onvm_config, budget);
+}
+
+static uint32_t
+shaper_drain_excess_locked(int ue_idx, struct rte_mbuf **tx_buf,
+                           uint32_t *nb_tx,
+                           struct onvm_configuration *onvm_config,
+                           uint32_t budget) {
+    struct ue_shaper *ue = &g_ue_shaper[ue_idx];
+    uint32_t sent = 0;
+
+    while (sent < budget &&
+           (ue->active_count[SHAPER_ACTIVE_YELLOW] > 0 ||
+            ue->active_count[SHAPER_ACTIVE_NQOS] > 0)) {
+        bool prefer_yellow = ue->next_excess_is_yellow != 0;
+        enum shaper_active_list_id list_id = prefer_yellow ?
+            SHAPER_ACTIVE_YELLOW : SHAPER_ACTIVE_NQOS;
+        enum ue_bucket_class bucket_class = prefer_yellow ?
+            UE_BUCKET_YELLOW : UE_BUCKET_NQOS;
+        uint32_t n;
+
+        n = shaper_drain_service_locked(ue_idx, list_id, bucket_class,
+                                        tx_buf, nb_tx, onvm_config, 1);
+        ue->next_excess_is_yellow = !ue->next_excess_is_yellow;
+        if (n == 0) {
+            list_id = prefer_yellow ? SHAPER_ACTIVE_NQOS :
+                                      SHAPER_ACTIVE_YELLOW;
+            bucket_class = prefer_yellow ? UE_BUCKET_NQOS :
+                                           UE_BUCKET_YELLOW;
+            n = shaper_drain_service_locked(ue_idx, list_id, bucket_class,
+                                            tx_buf, nb_tx, onvm_config, 1);
+            if (n == 0)
+                break;
+        }
+        sent += n;
+    }
+
+    return sent;
+}
+
+static uint32_t
+drain_ue_shaper(int ue_idx, struct onvm_nf *nf, uint32_t budget) {
+    struct rte_mbuf *tx_buf[DRAIN_CHUNK];
+    struct onvm_configuration *onvm_config;
+    struct ue_shaper *ue;
+    uint32_t nb_tx = 0;
+    uint32_t total = 0;
+
+    if (ue_idx < 0 || ue_idx >= MAX_UE || nf == NULL || budget == 0)
+        return 0;
+
+    ue = &g_ue_shaper[ue_idx];
+    onvm_config = onvm_nflib_get_onvm_config();
+    rte_spinlock_lock(&ue->lock);
+    if (ue->queued_pkts == 0) {
+        shaper_clear_ue_active(ue_idx);
+        rte_spinlock_unlock(&ue->lock);
+        return 0;
+    }
+
+    while (budget > 0 && nb_tx < DRAIN_CHUNK && ue->queued_pkts > 0) {
+        bool sent = false;
+        uint32_t tx_room = DRAIN_CHUNK - nb_tx;
+        uint32_t burst = RTE_MIN(budget, (uint32_t)SHAPER_CLASS_BURST);
+        uint32_t n;
+
+        burst = RTE_MIN(burst, tx_room);
+        if (burst == 0)
+            break;
+
+        n = shaper_drain_green_locked(ue_idx, tx_buf, &nb_tx,
+                                      onvm_config, burst);
+        if (n > 0) {
+            total += n;
+            budget -= n;
+            sent = true;
+            if (budget == 0 || nb_tx == DRAIN_CHUNK)
+                break;
+        }
+
+        tx_room = DRAIN_CHUNK - nb_tx;
+        burst = RTE_MIN(budget, (uint32_t)SHAPER_CLASS_BURST);
+        burst = RTE_MIN(burst, tx_room);
+        if (burst == 0)
+            break;
+
+        n = shaper_drain_excess_locked(ue_idx, tx_buf, &nb_tx,
+                                       onvm_config, burst);
+        if (n > 0) {
+            total += n;
+            budget -= n;
+            sent = true;
+        }
+
+        if (!sent)
+            break;
+    }
+    if (ue->queued_pkts == 0)
+        shaper_clear_ue_active(ue_idx);
+    else
+        shaper_mark_ue_active(ue_idx);
+    rte_spinlock_unlock(&ue->lock);
+
+    if (nb_tx > 0) {
+        onvm_pkt_process_tx_batch(nf->nf_tx_mgr, tx_buf,
+                                  onvm_config->dynfield_offset, nb_tx, nf);
+        onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
+    }
+    return total;
+}
+
+static uint32_t
+drain_shaper_queues(struct onvm_nf *nf) {
+    uint64_t tried_ue_bitmap[SHAPER_UE_BITMAP_WORDS] = {0};
+    uint32_t total = 0;
+    uint32_t budget = SHAPER_DRAIN_BUDGET;
+
+    for (uint32_t visited = 0; visited < SHAPER_SCAN_BUDGET && budget > 0; visited++) {
+        int ue_idx = shaper_next_active_ue(tried_ue_bitmap);
+        uint32_t drained;
+
+        if (ue_idx < 0)
+            break;
+
+        tried_ue_bitmap[(uint32_t)ue_idx / 64] |=
+            1ULL << ((uint32_t)ue_idx & 63);
+        drained = drain_ue_shaper(ue_idx, nf, budget);
+        total += drained;
+        budget -= drained;
+    }
+
+    return total;
+}
+
+static void
+shaper_cleanup(void) {
+    for (int ue_idx = 0; ue_idx < MAX_UE; ue_idx++) {
+        struct ue_shaper *ue = &g_ue_shaper[ue_idx];
+
+        rte_spinlock_lock(&ue->lock);
+        for (int flow_idx = 0; flow_idx < SHAPER_MAX_FLOWS_PER_UE; flow_idx++) {
+            struct shaper_flow *flow = &ue->flows[flow_idx];
+            struct shaper_entry *entry = flow->head;
+
+            while (entry != NULL) {
+                struct shaper_entry *next = entry->next;
+                if (entry->pkt != NULL)
+                    rte_pktmbuf_free(entry->pkt);
+                shaper_free_entry(entry);
+                entry = next;
+            }
+            memset(flow, 0, sizeof(*flow));
+        }
+        ue->queued_pkts = 0;
+        ue->next_excess_is_yellow = 1;
+        for (int list_id = 0; list_id < SHAPER_ACTIVE_COUNT; list_id++) {
+            TAILQ_INIT(&ue->active[list_id]);
+            ue->active_count[list_id] = 0;
+        }
+        rte_spinlock_unlock(&ue->lock);
+    }
+    for (uint32_t word_idx = 0; word_idx < SHAPER_UE_BITMAP_WORDS; word_idx++)
+        __atomic_store_n(&g_shaper_active_ue_bitmap[word_idx], 0,
+                         __ATOMIC_RELEASE);
+    g_shaper_active_ue_cursor = 0;
+}
+
+static bool
+build_dl_shaper_flow_key(struct rte_mbuf *pkt, const UPDK_PDR *pdr,
+                         uint32_t ue_ip, bool is_qos,
+                         struct shaper_flow_key *key) {
+    struct rte_ipv4_hdr *iph;
+    uint16_t l4_off;
+    uint32_t pkt_len;
+
+    if (pkt == NULL || key == NULL)
+        return false;
+
+    iph = onvm_pkt_ipv4_hdr(pkt);
+    if (iph == NULL || ((iph->version_ihl >> 4) != 4))
+        return false;
+
+    memset(key, 0, sizeof(*key));
+    key->ue_ip = ue_ip;
+    key->src_ip = rte_be_to_cpu_32(iph->src_addr);
+    key->dst_ip = rte_be_to_cpu_32(iph->dst_addr);
+    key->proto = iph->next_proto_id;
+    key->is_qos = is_qos ? 1 : 0;
+    key->qfi = (is_qos && pdr != NULL && pdr->qer != NULL) ?
+               QERGetQFI(pdr->qer) : 0;
+
+    l4_off = sizeof(struct rte_ether_hdr) +
+             ((iph->version_ihl & 0x0f) * 4);
+    pkt_len = rte_pktmbuf_pkt_len(pkt);
+    if (key->proto == IPPROTO_UDP &&
+        pkt_len >= l4_off + sizeof(struct rte_udp_hdr)) {
+        struct rte_udp_hdr udp_hdr;
+        const struct rte_udp_hdr *uh =
+            rte_pktmbuf_read(pkt, l4_off, sizeof(udp_hdr), &udp_hdr);
+        if (uh == NULL)
+            return false;
+        key->src_port = rte_be_to_cpu_16(uh->src_port);
+        key->dst_port = rte_be_to_cpu_16(uh->dst_port);
+    } else if (key->proto == IPPROTO_TCP &&
+               pkt_len >= l4_off + sizeof(struct rte_tcp_hdr)) {
+        struct rte_tcp_hdr tcp_hdr;
+        const struct rte_tcp_hdr *th =
+            rte_pktmbuf_read(pkt, l4_off, sizeof(tcp_hdr), &tcp_hdr);
+        if (th == NULL)
+            return false;
+        key->src_port = rte_be_to_cpu_16(th->src_port);
+        key->dst_port = rte_be_to_cpu_16(th->dst_port);
+    }
+
+    return true;
+}
 
 UPDK_PDR *
 GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
@@ -685,49 +1058,6 @@ GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
     ConfigureQerFlows(pdr, true);
 
     return pdr;
-}
-
-void *
-GetQerByUEIpAddress(uint32_t ue_ip, char *IP) {
-    if (findIndexByUeIpAddress(ue_ip) == -1) {        
-        UpfSession *session = UpfSessionFindByUeIP(ue_ip);
-        UTLT_Assert(session, return NULL, "session not found error");
-        UTLT_Assert(session->pdr_list, return NULL, "PDR list not initialized");
-        UTLT_Assert(session->pdr_list->len, return NULL, "PDR list contains 0 rules");
-
-        list_node_t *pnode = session->pdr_list->head;
-        list_node_t *qnode = NULL;
-        UpfPDR *pdr = NULL, *target_pdr = NULL;
-        uint32_t ambr = 0;
-        uint32_t gbr = 0;
-        uint32_t mbr = 0;
-
-        while (pnode) {
-            pdr = (UpfPDR *)pnode->val;
-            pnode = pnode->next;
-            for (int i =0;i<2;i++){
-                if (!pdr->qerId[i]) continue;
-                UpfQER * qer = UpfQERFindByID(session, pdr->qerId[i]);
-
-                if (ambr < qer->maximumBitrate.dl) {
-                    ambr = qer->maximumBitrate.dl;
-                }
-                if (qer->flags.guaranteedBitrate && qer->flags.maximumBitrate) {
-                    gbr = qer->guaranteedBitrate.dl;
-                    mbr = qer->maximumBitrate.dl;
-                }
-            }
-        }
-        if (ambr) {
-            UTLT_Warning("Add UE IP: %s, AMBR: %u GBR: %u, MBR: %u" , IP, ambr, gbr, mbr);
-            addEntrybyUeIp(ue_ip, ambr, gbr, mbr);
-            return NULL;
-        }
-    }
-    else {
-        UTLT_Trace("The UE IP already exists in the table");
-        return NULL;
-    }
 }
 
 /* Populate UE table using the already-classified UPDK_PDR (no session/pdr_list scan)*/
@@ -1000,6 +1330,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     gtp_parse_result_t gtp_info = {0};
     int ue_idx = -1;
     UpfSession *owner_session = NULL;
+    uint32_t ue_key = 0;
+    struct shaper_flow_key dl_flow_key = {0};
 
     /* char *src_address = convertToIpAddressString(iph->src_addr);
     UTLT_Info("Src IP is %s\n", src_address);
@@ -1037,16 +1369,22 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     if (!pdr) {
         UTLT_Error("no PDR found for %s, skip\n", convertToIpAddressString(iph->dst_addr));
-        // TODO(vivek): what to do?
+        meta->action = ONVM_NF_ACTION_DROP;
         return 0;
     }
     UTLT_Info("Got PDR ID is %u\n", pdr->pdrId);
 
     if (is_dl) {
-        uint32_t ue_key = rte_cpu_to_be_32(iph->dst_addr);
-        ue_idx = (int)findIndexByUeIpAddress(ue_key);
+        ue_key = rte_cpu_to_be_32(iph->dst_addr);
+        ue_idx = findIndexByUeIpAddress(ue_key);
         if (ue_idx < 0) {
             ue_idx = GetQerByUEIpAddressFromPdr(ue_key, pdr, convertToIpAddressString(iph->dst_addr));
+        }
+        if (!build_dl_shaper_flow_key(pkt, pdr, ue_key, pdr->has_fd,
+                                      &dl_flow_key)) {
+            UTLT_Error("Failed to build DL shaper flow key");
+            meta->action = ONVM_NF_ACTION_DROP;
+            return 0;
         }
     }
 
@@ -1143,7 +1481,9 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             goto dl_nocp;
         }
 
-        /* QoS policing — FORW only */
+        /* QoS shaping — FORW only, after GTP-U/L2 TX prep is complete.
+         * Over-token packets wait in bounded per-flow FIFOs; only red,
+         * invalid, or queue-overflow packets drop. */
         if (far_action == UPDK_FAR_APPLY_ACTION_FORW) {
             if (ue_idx < 0) {
                 UTLT_Error("No UE IP found in the table");
@@ -1160,8 +1500,17 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 isQos = true;
                 trtcm_profile = &app_flow_trtcm_profile;
                 int ft_idx = ftSearch(pdr->meter_key);
+                if (unlikely(ft_idx < 0 || ft_idx >= (int)APP_FLOWS_MAX)) {
+                    UTLT_Warning("DL QoS: no trTCM flow for meter_key=%u (ft_idx=%d) pdr=%u seid=%lu; dropping",
+                                 pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                    meta->flags = RTE_COLOR_RED;
+                    meta->action = ONVM_NF_ACTION_DROP;
+                    goto dl_nocp;
+                }
                 color_result = trtcmColorHandle(cal_pktlen, curr_time,
                                                 ft_idx, trtcm_profile);
+                // set the meta action to out for now, and trtcmPolicer will update it to drop if color is red
+                meta->action = ONVM_NF_ACTION_OUT;
                 if (trtcmPolicer(meta, color_result) > 0)
                     UTLT_Error("trTCM Policer error");
             }
@@ -1169,20 +1518,27 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             if (isQos) {
                 if (meta->flags == RTE_COLOR_RED) {
                     meta->action = ONVM_NF_ACTION_DROP;
+                    __atomic_fetch_add(&g_shaper_drop_red, 1, __ATOMIC_RELAXED);
                     goto dl_nocp;
                 }
                 if (meta->flags == RTE_COLOR_GREEN ||
                     meta->flags == RTE_COLOR_YELLOW) {
-                    if (!consumeUeBucketTokens(ue_idx, true, cal_pktlen)) {
-                        meta->action = ONVM_NF_ACTION_DROP;
+                    enum shaper_pkt_color color =
+                        (meta->flags == RTE_COLOR_GREEN) ?
+                        SHAPER_COLOR_GREEN : SHAPER_COLOR_YELLOW;
+                    enum shaper_decision decision =
+                        shape_or_enqueue_packet(ue_idx, &dl_flow_key, true,
+                                                color, pkt, cal_pktlen, meta);
+                    if (decision != SHAPER_PASS)
                         goto dl_nocp;
-                    }
                 }
             } else {
-                if (!consumeUeBucketTokens(ue_idx, false, cal_pktlen)) {
-                    meta->action = ONVM_NF_ACTION_DROP;
+                enum shaper_decision decision =
+                    shape_or_enqueue_packet(ue_idx, &dl_flow_key, false,
+                                            SHAPER_COLOR_NQOS, pkt,
+                                            cal_pktlen, meta);
+                if (decision != SHAPER_PASS)
                     goto dl_nocp;
-                }
             }
         }
 
@@ -1228,6 +1584,32 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             /* Get the DN server IP address */
             uint32_t dn_server_ip_be = inner_iph->dst_addr;
             UTLT_Trace("DN server IP: %s\n", convertToIpAddressString(dn_server_ip_be));
+
+            /* UL QoS policing (flow-level): applies when CP provided SDF (has_fd)
+             * and per-flow QER contains MBR/GBR. For UDP tests, you must check
+             * server-side throughput/loss or use TCP to observe the cap. */
+            if (pdr && pdr->has_fd && pdr->qer && pdr->qer->flags.maximumBitrate) {
+                uint32_t dst_ip_host = rte_be_to_cpu_32(dn_server_ip_be);
+                if (!pdr->has_fd_to || (dst_ip_host & pdr->fd_to_mask) == pdr->fd_to_net) {
+                    int ft_idx = ftSearch(pdr->meter_key);
+                    if (unlikely(ft_idx < 0 || ft_idx >= (int)APP_FLOWS_MAX)) {
+                        UTLT_Warning("UL QoS: no trTCM flow for meter_key=%u (ft_idx=%d) pdr=%u seid=%lu; dropping",
+                                    pdr->meter_key, ft_idx, pdr->pdrId, seid);
+                        meta->flags = RTE_COLOR_RED;
+                        meta->action = ONVM_NF_ACTION_DROP;
+                        return 0;
+                    }
+
+                    uint64_t curr_time = rte_get_tsc_cycles();
+                    int color_result = trtcmColorHandle(pkt->pkt_len, curr_time,
+                                                        ft_idx, &app_flow_trtcm_profile);
+                    if (trtcmPolicer(meta, color_result) > 0)
+                        UTLT_Error("UL trTCM Policer error");
+
+                    if (meta->action == ONVM_NF_ACTION_DROP)
+                        return 0;
+                }
+            }
 
             /* Attach L2 (or ARP) header for the N6-bound packet */
             if (attach_l2_or_arp(pkt, g_n6_port, g_n6_ip_be, dn_server_ip_be,
@@ -1277,33 +1659,43 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
     if (e) rte_free(e);
 }
 
-uint64_t last_p = NULL;
+static uint64_t last_p = 0;
 
-static int 
+static int
 callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
     if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
-    uint64_t cur_p = rte_get_tsc_cycles(), before;
-    struct onvm_nf *nf;
-    struct onvm_pkt_meta *meta;
-    struct packet_buf *out_buf;
-    nf = nf_local_ctx->nf;
+    uint64_t cur_p = rte_get_tsc_cycles();
+    struct onvm_nf *nf = nf_local_ctx->nf;
 
-    // if (buffer_length > 0){
-    //     for (int i = 0; i < buffer_length; i++) {
-    //         meta = onvm_get_pkt_meta(buffer[i]);
-    //         meta->action = ONVM_NF_ACTION_OUT;
-    //     }
-    //     onvm_pkt_process_tx_batch(nf->nf_tx_mgr, buffer, buffer_length, nf);
-    //     onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
-    //     UTLT_Debug("Sending out %u packets\n", buffer_length);
-    //     buffer_length = 0;
-    // } 
+    drain_shaper_queues(nf);
 
-    if (unlikely((cur_p - last_p)/(double)rte_get_timer_hz() > 1)){
+    if (unlikely(cur_p - last_p > rte_get_timer_hz())) {
         last_p = cur_p;
         UTLT_Debug("Stats perform: ");
         UTLT_Debug("act out: %d", nf->stats.act_out);
         UTLT_Debug("buffered: %d", nf->stats.tx_buffer);
+        UTLT_Debug("shaper queued: %" PRIu64,
+                   __atomic_load_n(&g_shaper_queued, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper drained: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drained, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper invalid drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_invalid, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper red drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_red, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper green overflow drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_green_overflow, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper yellow overflow drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_yellow_overflow, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper non-QoS overflow drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_nqos_overflow, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper flow table full drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_flow_table_full, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper flow queue full drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_flow_queue_full, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper UE queue full drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_ue_queue_full, __ATOMIC_RELAXED));
+        UTLT_Debug("shaper mempool empty drops: %" PRIu64,
+                   __atomic_load_n(&g_shaper_drop_mempool_empty, __ATOMIC_RELAXED));
     }
 
     return 0;
@@ -1321,7 +1713,7 @@ main(int argc, char *argv[]) {
     nf_function_table = onvm_nflib_init_nf_function_table();
     nf_function_table->pkt_handler = &packet_handler;
     nf_function_table->msg_handler = &msg_handler;
-    // nf_function_table->user_actions = &callback_handler;
+    nf_function_table->user_actions = &callback_handler;
 
     if ((arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table)) < 0) {
         onvm_nflib_stop(nf_local_ctx);
@@ -1376,8 +1768,14 @@ main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "failed to init ARP module\n");
     }
 
+    shaper_init_state();
+    if (shaper_init_entry_pool(nf_local_ctx->nf) < 0) {
+        rte_exit(EXIT_FAILURE, "Failed to init UPF-U shaper entry pool.\n");
+    }
+
     onvm_nflib_run(nf_local_ctx);
 
+    shaper_cleanup();
     onvm_nflib_stop(nf_local_ctx);
     return 0;
 }

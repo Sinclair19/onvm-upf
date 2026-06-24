@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 #include <rte_ether.h>
+#include <rte_ethdev.h>
 
 extern uint32_t g_n3_ip_be;     // UPF local IP on the access-facing port
 extern uint32_t g_n6_ip_be;     // UPF local IP on the core/SGi-facing port
