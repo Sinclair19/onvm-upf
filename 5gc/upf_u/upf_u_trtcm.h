@@ -46,7 +46,7 @@ struct ue_hash_entry {
 
 /* Token Bucket */
 struct tb_config {
-    uint64_t tb_rate;    // rate at which tokens are generated (in MBps)
+    uint64_t tb_rate;    // token generation rate in Kbps
     uint64_t tb_depth;   // depth of the token bucket (in bytes)
     uint64_t tb_tokens;  // number of the tokens in the bucket at any given time (in bytes)
     uint64_t last_cycle;
@@ -54,13 +54,21 @@ struct tb_config {
     uint16_t used;
 };
 
+enum ue_bucket_class {
+    UE_BUCKET_GREEN = 0,
+    UE_BUCKET_YELLOW,
+    UE_BUCKET_NQOS,
+    UE_BUCKET_COUNT
+};
+
 struct ue_tb {
     uint32_t ue_ip;
     uint32_t ue_ambr;
     uint32_t ue_gbr;
     uint32_t ue_mbr;
-    struct tb_config ue_nqos_tb_params;
-    struct tb_config ue_qos_tb_params;
+    struct tb_config ue_green_tb_params;
+    struct tb_config ue_excess_tb_params;
+    struct tb_config ue_yellow_cap_tb_params;
 };
 
 extern flow_entry_t iPFlows[APP_FLOWS_MAX];
@@ -84,7 +92,7 @@ trtcmColorHandle(uint32_t pkt_len, uint64_t time, uint8_t qfi, struct rte_meter_
 int
 trtcmPolicer(struct onvm_pkt_meta *meta, int color_result);
 
-void 
+void
 initUeTable();
 
 void
@@ -96,11 +104,17 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink);
 int
 ftSearch(uint32_t subnet);
 
-int 
+int
 findIndexByUeIpAddress(uint32_t ue_ip);
 
-void 
+void
 updateTokenbyIndex(int index);
+
+bool
+ueBucketCanFitPacket(int index, enum ue_bucket_class bucket_class, uint32_t pkt_len);
+
+bool
+consumeUeBucketTokens(int index, enum ue_bucket_class bucket_class, uint32_t pkt_len);
 
 int
 addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr, uint32_t ue_mbr);
