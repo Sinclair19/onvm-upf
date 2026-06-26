@@ -1107,11 +1107,86 @@ GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
     return pdr;
 }
 
-/* Populate UE table using the already-classified UPDK_PDR (no session/pdr_list scan)*/
-static inline int
-GetQerByUEIpAddressFromPdr(uint32_t ue_ip, const UPDK_PDR *pdr, const char *ip_str)
+static inline void
+AccumulateQerDlRates(const UPDK_QER *q, uint64_t *ambr64,
+                     uint64_t *gbr64, uint64_t *mbr64,
+                     bool *has_gbr_qer)
 {
-    if (!pdr || pdr->qer_count == 0) {
+    if (!q || !q->flags.maximumBitrate)
+        return;
+
+    if (q->flags.guaranteedBitrate) {
+        *has_gbr_qer = true;
+        *gbr64 = saturating_add_u64(*gbr64, q->guaranteedBitrate.dl);
+        *mbr64 = saturating_add_u64(*mbr64, q->maximumBitrate.dl);
+        return;
+    }
+
+    if (q->maximumBitrate.dl > *ambr64)
+        *ambr64 = q->maximumBitrate.dl;
+}
+
+static inline bool
+GetQerRatesFromSession(UpfSession *session, uint64_t *ambr64,
+                       uint64_t *gbr64, uint64_t *mbr64,
+                       bool *has_gbr_qer)
+{
+    list_iterator_t *it;
+    list_node_t *node;
+    bool found = false;
+
+    if (!session || !session->qer_list)
+        return false;
+
+    it = list_iterator_new(session->qer_list, LIST_HEAD);
+    if (!it)
+        return false;
+
+    while ((node = list_iterator_next(it)) != NULL) {
+        const UPDK_QER *q = (const UPDK_QER *)node->val;
+        if (!q || !q->flags.maximumBitrate)
+            continue;
+
+        found = true;
+        AccumulateQerDlRates(q, ambr64, gbr64, mbr64, has_gbr_qer);
+    }
+
+    list_iterator_destroy(it);
+    return found;
+}
+
+static inline bool
+GetQerRatesFromPdr(const UPDK_PDR *pdr, uint64_t *ambr64,
+                   uint64_t *gbr64, uint64_t *mbr64,
+                   bool *has_gbr_qer)
+{
+    bool found = false;
+
+    if (!pdr || pdr->qer_count == 0)
+        return false;
+
+    int n = (int)pdr->qer_count;
+    if (n > 2) n = 2; /* safety; struct currently supports 2 */
+
+    for (int i = 0; i < n; i++) {
+        const UPDK_QER *q = pdr->qers[i];
+        if (!q || !q->flags.maximumBitrate)
+            continue;
+
+        found = true;
+        AccumulateQerDlRates(q, ambr64, gbr64, mbr64, has_gbr_qer);
+    }
+
+    return found;
+}
+
+/* Populate UE table from the owning session when possible. The session-level
+ * non-GBR QER carries AMBR; GBR-bearing QERs carry QoS flow GBR/MBR. */
+static inline int
+GetQerByUEIpAddressFromPdr(uint32_t ue_ip, UpfSession *session,
+                           const UPDK_PDR *pdr, const char *ip_str)
+{
+    if ((!session || !session->qer_list) && (!pdr || pdr->qer_count == 0)) {
         UTLT_Trace("UE %s: No PDR or PDR has no QERs, skip UE table entry",
                    ip_str ? ip_str : "<unknown>");
         return -1;
@@ -1122,22 +1197,12 @@ GetQerByUEIpAddressFromPdr(uint32_t ue_ip, const UPDK_PDR *pdr, const char *ip_s
     uint64_t mbr64  = 0;
     bool has_gbr_qer = false;
 
-    int n = (int)pdr->qer_count;
-    if (n > 2) n = 2; /* safety; struct currently supports 2 */
-
-    for (int i = 0; i < n; i++) {
-        const UPDK_QER *q = pdr->qers[i];
-        if (!q) continue;
-
-        if (q->flags.maximumBitrate && q->maximumBitrate.dl > ambr64)
-            ambr64 = q->maximumBitrate.dl;
-
-        if (q->flags.guaranteedBitrate && q->flags.maximumBitrate) {
-            has_gbr_qer = true;
-            gbr64 = saturating_add_u64(gbr64, q->guaranteedBitrate.dl);
-            mbr64 = saturating_add_u64(mbr64, q->maximumBitrate.dl);
-        }
+    if (!GetQerRatesFromSession(session, &ambr64, &gbr64, &mbr64,
+                                &has_gbr_qer)) {
+        GetQerRatesFromPdr(pdr, &ambr64, &gbr64, &mbr64, &has_gbr_qer);
     }
+    if (ambr64 == 0 && mbr64 > 0)
+        ambr64 = mbr64;
 
     if (ambr64 == 0) {
         UTLT_Trace("UE %s: no DL MBR across PDR QERs, skip UE table entry",
@@ -1428,7 +1493,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
         ue_key = rte_cpu_to_be_32(iph->dst_addr);
         ue_idx = findIndexByUeIpAddress(ue_key);
         if (ue_idx < 0) {
-            ue_idx = GetQerByUEIpAddressFromPdr(ue_key, pdr, convertToIpAddressString(iph->dst_addr));
+            ue_idx = GetQerByUEIpAddressFromPdr(ue_key, owner_session, pdr,
+                                                convertToIpAddressString(iph->dst_addr));
         }
         if (!build_dl_shaper_flow_key(pkt, pdr, ue_key, pdr->has_fd,
                                       &dl_flow_key)) {
