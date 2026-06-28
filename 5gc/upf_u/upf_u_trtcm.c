@@ -29,7 +29,7 @@
 #include "../classifiers/classifier_wrapper.h"
 
 #define MIN_TOKEN_BUCKET_DEPTH 2048
-#define TOKEN_BUCKET_BURST_MS 10
+#define TOKEN_BUCKET_BURST_MS 100
 #define TRTCM_BURST_MS 100
 
 flow_entry_t iPFlows[APP_FLOWS_MAX];
