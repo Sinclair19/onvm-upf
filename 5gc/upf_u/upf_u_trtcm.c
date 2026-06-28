@@ -351,6 +351,38 @@ bucketCanFitPacket(const struct tb_config *tb, uint32_t pkt_len) {
     return tb->tb_depth > 0 && pkt_len <= tb->tb_depth;
 }
 
+uint64_t
+ueShaperQueueLimitBytes(int index, bool is_qos, uint32_t delay_ms, uint64_t min_bytes) {
+    uint64_t rate_kbps = 0;
+    uint64_t limit_bytes;
+
+    if (unlikely(index < 0 || index >= MAX_UE))
+        return min_bytes;
+
+    rte_spinlock_lock(&ue_tb_locks[index]);
+    if (ueTokenIndexValid(index)) {
+        if (is_qos) {
+            if (ue_table[index].ue_mbr > 0)
+                rate_kbps = ue_table[index].ue_mbr;
+            else if (ue_table[index].ue_gbr > 0)
+                rate_kbps = ue_table[index].ue_gbr;
+            else
+                rate_kbps = ue_table[index].ue_ambr;
+        } else {
+            rate_kbps = ue_table[index].ue_excess_tb_params.tb_rate;
+            if (rate_kbps == 0)
+                rate_kbps = ue_table[index].ue_ambr;
+        }
+    }
+    rte_spinlock_unlock(&ue_tb_locks[index]);
+
+    if (rate_kbps == 0 || delay_ms == 0)
+        return min_bytes;
+
+    limit_bytes = (rate_kbps * (uint64_t)delay_ms + 7) / 8;
+    return limit_bytes > min_bytes ? limit_bytes : min_bytes;
+}
+
 void
 ueHashInit(void) {
     for (int i = 0; i < MAX_UE; i++)

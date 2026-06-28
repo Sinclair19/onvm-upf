@@ -119,6 +119,9 @@ ueBucketCanFitPacket(int index, enum ue_bucket_class bucket_class, uint32_t pkt_
 bool
 consumeUeBucketTokens(int index, enum ue_bucket_class bucket_class, uint32_t pkt_len);
 
+uint64_t
+ueShaperQueueLimitBytes(int index, bool is_qos, uint32_t delay_ms, uint64_t min_bytes);
+
 int
 addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr, uint32_t ue_mbr);
 
