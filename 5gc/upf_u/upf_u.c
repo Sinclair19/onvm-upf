@@ -68,15 +68,15 @@
 
 /* Used for buffering */
 #define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
-#define DRAIN_CHUNK             64    /* max pkts dequeued per drain call */
+#define DRAIN_CHUNK             128   /* max pkts dequeued per drain call */
 
 /* Used for non-blocking UE token-bucket shaping */
 #define SHAPER_SCAN_BUDGET       32
-#define SHAPER_DRAIN_BUDGET      64
-#define SHAPER_CLASS_BURST        8
+#define SHAPER_DRAIN_BUDGET      128
+#define SHAPER_CLASS_BURST        16
 #define SHAPER_MAX_FLOWS_PER_UE  64
-#define SHAPER_MAX_PKTS_PER_FLOW 256
-#define SHAPER_MAX_PKTS_PER_UE   1024
+#define SHAPER_MAX_PKTS_PER_FLOW 512
+#define SHAPER_MAX_PKTS_PER_UE   2048
 #define SHAPER_ENTRY_POOL_CACHE  256
 #define SHAPER_UE_BITMAP_WORDS   ((MAX_UE + 63) / 64)
 
