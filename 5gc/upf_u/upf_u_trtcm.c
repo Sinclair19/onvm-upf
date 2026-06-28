@@ -679,11 +679,6 @@ consumeUeBucketTokens(int index, enum ue_bucket_class bucket_class, uint32_t pkt
             excess_tb->tb_tokens -= pkt_len;
             yellow_cap_tb->tb_tokens -= pkt_len;
             consumed = true;
-        } else if (green_tb->tb_tokens >= pkt_len) {
-            /* Preserve FIFO order when a yellow head packet would otherwise
-             * block later green packets from using available GFBR tokens. */
-            green_tb->tb_tokens -= pkt_len;
-            consumed = true;
         }
         break;
     case UE_BUCKET_NQOS:
