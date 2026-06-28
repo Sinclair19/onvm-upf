@@ -73,7 +73,10 @@
 /* Used for non-blocking UE token-bucket shaping */
 #define SHAPER_SCAN_BUDGET       32
 #define SHAPER_DRAIN_BUDGET      128
+#define SHAPER_INLINE_DRAIN_BUDGET 32
 #define SHAPER_CLASS_BURST        16
+#define SHAPER_MAX_QUEUE_DELAY_MS 100
+#define SHAPER_MIN_QUEUE_PKTS     4
 #define SHAPER_MAX_FLOWS_PER_UE  64
 #define SHAPER_MAX_PKTS_PER_FLOW 512
 #define SHAPER_MAX_PKTS_PER_UE   2048
@@ -501,6 +504,52 @@ shaper_count_overflow(enum shaper_pkt_color color) {
         __atomic_fetch_add(&g_shaper_drop_nqos_overflow, 1, __ATOMIC_RELAXED);
 }
 
+static void
+shaper_drop_head_locked(struct ue_shaper *ue, struct shaper_flow *flow) {
+    struct shaper_entry *entry;
+
+    if (ue == NULL || flow == NULL || flow->head == NULL)
+        return;
+
+    entry = flow->head;
+    flow->head = entry->next;
+    if (flow->head == NULL)
+        flow->tail = NULL;
+    flow->queued_pkts--;
+    flow->queued_bytes -= entry->pkt_len;
+    ue->queued_pkts--;
+
+    rte_pktmbuf_free(entry->pkt);
+    shaper_count_overflow(entry->color);
+    shaper_free_entry(entry);
+    __atomic_fetch_add(&g_shaper_drop_flow_queue_full, 1,
+                       __ATOMIC_RELAXED);
+}
+
+static void
+shaper_trim_flow_for_enqueue_locked(struct ue_shaper *ue,
+                                    struct shaper_flow *flow,
+                                    uint32_t pkt_len,
+                                    uint64_t queue_limit_bytes) {
+    bool was_active;
+
+    if (ue == NULL || flow == NULL || flow->queued_pkts == 0)
+        return;
+
+    was_active = flow->active_list != SHAPER_ACTIVE_NONE;
+    if (was_active)
+        shaper_deactivate_flow(ue, flow);
+
+    while (flow->head != NULL &&
+           (flow->queued_pkts >= SHAPER_MAX_PKTS_PER_FLOW ||
+            (uint64_t)flow->queued_bytes + pkt_len > queue_limit_bytes)) {
+        shaper_drop_head_locked(ue, flow);
+    }
+
+    if (flow->head != NULL)
+        shaper_activate_flow(ue, flow);
+}
+
 static inline bool
 shaper_class_has_backlog_locked(const struct ue_shaper *ue,
                                 enum ue_bucket_class bucket_class) {
@@ -538,17 +587,33 @@ shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
     struct shaper_entry *entry;
     enum ue_bucket_class bucket_class =
         shaper_bucket_for_packet(is_qos, color);
+    uint64_t min_queue_bytes;
+    uint64_t queue_limit_bytes;
+
+    if (unlikely(pkt == NULL || key == NULL || g_shaper_entry_pool == NULL)) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        shaper_count_overflow(color);
+        return SHAPER_DROP;
+    }
+    if (pkt_len == 0)
+        pkt_len = rte_pktmbuf_pkt_len(pkt);
+    if (pkt_len == 0) {
+        meta->action = ONVM_NF_ACTION_DROP;
+        __atomic_fetch_add(&g_shaper_drop_invalid, 1, __ATOMIC_RELAXED);
+        return SHAPER_DROP;
+    }
+    min_queue_bytes = (uint64_t)pkt_len * SHAPER_MIN_QUEUE_PKTS;
 
     if (!ueBucketCanFitPacket(ue_idx, bucket_class, pkt_len)) {
         meta->action = ONVM_NF_ACTION_DROP;
         __atomic_fetch_add(&g_shaper_drop_invalid, 1, __ATOMIC_RELAXED);
         return SHAPER_DROP;
     }
-    if (unlikely(pkt == NULL || key == NULL || g_shaper_entry_pool == NULL)) {
-        meta->action = ONVM_NF_ACTION_DROP;
-        shaper_count_overflow(color);
-        return SHAPER_DROP;
-    }
+
+    queue_limit_bytes =
+        ueShaperQueueLimitBytes(ue_idx, is_qos,
+                                SHAPER_MAX_QUEUE_DELAY_MS,
+                                min_queue_bytes);
 
     ue = &g_ue_shaper[ue_idx];
     rte_spinlock_lock(&ue->lock);
@@ -571,6 +636,8 @@ shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
         shaper_count_overflow(color);
         return SHAPER_DROP;
     }
+    shaper_trim_flow_for_enqueue_locked(ue, flow, pkt_len,
+                                        queue_limit_bytes);
     if (flow->queued_pkts >= SHAPER_MAX_PKTS_PER_FLOW) {
         rte_spinlock_unlock(&ue->lock);
         meta->action = ONVM_NF_ACTION_DROP;
@@ -580,6 +647,8 @@ shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
         return SHAPER_DROP;
     }
     if (ue->queued_pkts >= SHAPER_MAX_PKTS_PER_UE) {
+        if (flow->queued_pkts == 0)
+            shaper_release_empty_flow(ue, flow);
         rte_spinlock_unlock(&ue->lock);
         meta->action = ONVM_NF_ACTION_DROP;
         __atomic_fetch_add(&g_shaper_drop_ue_queue_full, 1,
@@ -588,6 +657,8 @@ shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
         return SHAPER_DROP;
     }
     if (rte_mempool_get(g_shaper_entry_pool, (void **)&entry) != 0) {
+        if (flow->queued_pkts == 0)
+            shaper_release_empty_flow(ue, flow);
         rte_spinlock_unlock(&ue->lock);
         meta->action = ONVM_NF_ACTION_DROP;
         __atomic_fetch_add(&g_shaper_drop_mempool_empty, 1,
@@ -838,10 +909,9 @@ drain_ue_shaper(int ue_idx, struct onvm_nf *nf, uint32_t budget) {
 }
 
 static uint32_t
-drain_shaper_queues(struct onvm_nf *nf) {
+drain_shaper_queues_budget(struct onvm_nf *nf, uint32_t budget) {
     uint64_t tried_ue_bitmap[SHAPER_UE_BITMAP_WORDS] = {0};
     uint32_t total = 0;
-    uint32_t budget = SHAPER_DRAIN_BUDGET;
 
     for (uint32_t visited = 0; visited < SHAPER_SCAN_BUDGET && budget > 0; visited++) {
         int ue_idx = shaper_next_active_ue(tried_ue_bitmap);
@@ -858,6 +928,11 @@ drain_shaper_queues(struct onvm_nf *nf) {
     }
 
     return total;
+}
+
+static uint32_t
+drain_shaper_queues(struct onvm_nf *nf) {
+    return drain_shaper_queues_budget(nf, SHAPER_DRAIN_BUDGET);
 }
 
 static void
@@ -1373,6 +1448,9 @@ drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
 
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+    if (nf_local_ctx != NULL && nf_local_ctx->nf != NULL)
+        drain_shaper_queues_budget(nf_local_ctx->nf,
+                                   SHAPER_INLINE_DRAIN_BUDGET);
     if (pkt == NULL || meta == NULL) {
         return 0;
     }
