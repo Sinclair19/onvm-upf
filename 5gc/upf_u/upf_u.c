@@ -67,8 +67,9 @@
 #define NF_TAG "upf_u"
 
 /* Used for buffering */
-#define INLINE_DRAIN_BATCH       8    /* pkts drained per INLINE (FORW)  */
 #define DRAIN_CHUNK             128   /* max pkts dequeued per drain call */
+#define SESS_DRAIN_SCAN_BUDGET   32   /* shared drain requests per callback */
+#define SESS_DRAIN_BITMAP_WORDS  ((SESS_BUF_MAX_USERS + 63) / 64)
 
 /* Used for non-blocking UE token-bucket shaping */
 #define SHAPER_SCAN_BUDGET       32
@@ -163,6 +164,45 @@ static uint64_t g_shaper_drop_flow_table_full;
 static uint64_t g_shaper_drop_flow_queue_full;
 static uint64_t g_shaper_drop_ue_queue_full;
 static uint64_t g_shaper_drop_mempool_empty;
+static uint64_t g_sess_drain_bitmap[SESS_DRAIN_BITMAP_WORDS];
+static uint32_t g_sess_drain_scan_cursor;
+static uint32_t g_sess_drain_active_count;
+static uint64_t g_sess_buffer_queued;
+static uint64_t g_sess_buffer_drained;
+static uint64_t g_sess_buffer_full_drops;
+static uint64_t g_sess_buffer_deferred_forw;
+static uint64_t g_sess_buffer_far_conflict_drops;
+
+static inline void
+mark_session_drain_active(int sess_idx) {
+    uint32_t word_idx;
+    uint64_t bit;
+
+    if (sess_idx < 0 || sess_idx >= SESS_BUF_MAX_USERS)
+        return;
+    word_idx = (uint32_t)sess_idx / 64;
+    bit = 1ULL << ((uint32_t)sess_idx & 63);
+    if ((g_sess_drain_bitmap[word_idx] & bit) == 0) {
+        g_sess_drain_bitmap[word_idx] |= bit;
+        g_sess_drain_active_count++;
+    }
+}
+
+static inline void
+clear_session_drain_active(int sess_idx) {
+    uint32_t word_idx;
+    uint64_t bit;
+
+    if (sess_idx < 0 || sess_idx >= SESS_BUF_MAX_USERS)
+        return;
+    word_idx = (uint32_t)sess_idx / 64;
+    bit = 1ULL << ((uint32_t)sess_idx & 63);
+    if (g_sess_drain_bitmap[word_idx] & bit) {
+        g_sess_drain_bitmap[word_idx] &= ~bit;
+        if (g_sess_drain_active_count > 0)
+            g_sess_drain_active_count--;
+    }
+}
 
 typedef struct {
     void    *ptr;          // current active snapshot (cls_handle_t*)
@@ -1435,17 +1475,106 @@ drain_session_batch(int sess_idx, uint32_t max_pkts, struct onvm_nf *nf) {
 
         onvm_pkt_process_tx_batch(nf->nf_tx_mgr, drain_buf,
                                   onvm_config->dynfield_offset, n, nf);
-        onvm_pkt_flush_all_nfs(nf->nf_tx_mgr, nf);
         total += n;
     }
-    if (rte_ring_count(sb->ring) == 0)
+    if (total > 0)
+        onvm_pkt_enqueue_tx_thread(nf->nf_tx_mgr->to_tx_buf, nf);
+    if (rte_ring_count(sb->ring) == 0) {
         sb->touched = 0;
+        sb->buffering_far_id = 0;
+        __atomic_store_n(&sb->drain_far_id, 0, __ATOMIC_RELEASE);
+    }
+    __atomic_fetch_add(&g_sess_buffer_drained, total, __ATOMIC_RELAXED);
     return total;
+}
+
+/* Keep the packet behind the existing session backlog. The NF framework still
+ * owns its original reference and will release it after packet_handler returns;
+ * the ring owns the additional reference until a later drain callback. */
+static int
+enqueue_session_packet(UpfSessBuf *sb, struct rte_mbuf *pkt,
+                       struct onvm_pkt_meta *meta, bool deferred_forw) {
+    if (unlikely(sb == NULL || sb->ring == NULL || pkt == NULL || meta == NULL)) {
+        if (meta != NULL)
+            meta->action = ONVM_NF_ACTION_DROP;
+        return -1;
+    }
+
+    rte_mbuf_refcnt_update(pkt, 1);
+    if (rte_ring_sp_enqueue(sb->ring, pkt) != 0) {
+        rte_mbuf_refcnt_update(pkt, -1);
+        meta->action = ONVM_NF_ACTION_DROP;
+        __atomic_fetch_add(&g_sess_buffer_full_drops, 1,
+                           __ATOMIC_RELAXED);
+        return -1;
+    }
+
+    sb->touched = 1;
+    meta->action = ONVM_NF_ACTION_DROP;
+    __atomic_fetch_add(&g_sess_buffer_queued, 1, __ATOMIC_RELAXED);
+    if (deferred_forw) {
+        __atomic_fetch_add(&g_sess_buffer_deferred_forw, 1,
+                           __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+
+/* Recover drain requests even if the notification message was lost, then
+ * empty every locally active FIFO. Draining happens from the user callback,
+ * after the framework has released the original references of packets that
+ * were deferred by the current RX burst. */
+static void
+drain_ready_session_buffers(struct onvm_nf *nf) {
+    for (uint32_t scanned = 0; scanned < SESS_DRAIN_SCAN_BUDGET; scanned++) {
+        uint32_t sess_idx = g_sess_drain_scan_cursor++ % SESS_BUF_MAX_USERS;
+        UpfSessBuf *sb = &g_sess_buf[sess_idx];
+
+        if (__atomic_exchange_n(&sb->drain_requested, 0,
+                                __ATOMIC_ACQ_REL) == 0)
+            continue;
+        uint32_t drain_far_id =
+            __atomic_load_n(&sb->drain_far_id, __ATOMIC_ACQUIRE);
+        if (sb->touched && sb->buffering_far_id != drain_far_id) {
+            UTLT_Warning("Ignore session %u drain for FAR %u; FIFO belongs to FAR %u",
+                         sess_idx, drain_far_id, sb->buffering_far_id);
+            continue;
+        }
+        sb->is_buffering = 0;
+        if (sb->touched)
+            mark_session_drain_active((int)sess_idx);
+    }
+
+    for (uint32_t word_idx = 0; word_idx < SESS_DRAIN_BITMAP_WORDS;
+         word_idx++) {
+        uint64_t active = g_sess_drain_bitmap[word_idx];
+
+        while (active != 0) {
+            uint32_t bit_idx = (uint32_t)__builtin_ctzll(active);
+            uint32_t sess_idx = word_idx * 64 + bit_idx;
+            UpfSessBuf *sb;
+
+            active &= active - 1;
+            if (sess_idx >= SESS_BUF_MAX_USERS)
+                continue;
+            clear_session_drain_active((int)sess_idx);
+            sb = &g_sess_buf[sess_idx];
+            if (!sb->ring_created || !sb->ring || !sb->touched ||
+                sb->is_buffering)
+                continue;
+            drain_session_batch((int)sess_idx, UINT32_MAX, nf);
+            if (sb->touched && !sb->is_buffering)
+                mark_session_drain_active((int)sess_idx);
+        }
+    }
 }
 
 static int
 packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
-    if (nf_local_ctx != NULL && nf_local_ctx->nf != NULL)
+    /* Session backlog drains before newly queued shaper packets. Once a
+     * session drain is active, defer inline shaper progress to the callback,
+     * which runs the session drain first. */
+    if (nf_local_ctx != NULL && nf_local_ctx->nf != NULL &&
+        g_sess_drain_active_count == 0)
         drain_shaper_queues_budget(nf_local_ctx->nf,
                                    SHAPER_INLINE_DRAIN_BUDGET);
     if (pkt == NULL || meta == NULL) {
@@ -1580,8 +1709,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     if (is_dl) {
         /* ── DL: split BUFF vs FORW ─────────────────────────── */
         uint8_t far_action = far->applyAction & FAR_ACTION_MASK;
-        struct onvm_nf *nf = nf_local_ctx->nf;
         int32_t sess_idx = pdr->session_index;
+        bool defer_for_order = false;
 
         /* DROP → just let the framework free the pkt */
         if (far_action == UPDK_FAR_APPLY_ACTION_DROP) {
@@ -1625,21 +1754,29 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
         if (far_action == UPDK_FAR_APPLY_ACTION_BUFF) {
             /* Buffer-only: prepare packet for later TX, enqueue, then DROP */
-            sb->is_buffering = 1;
-
-            /* Enqueue into session ring.
-             * Bump refcnt so the framework's rte_pktmbuf_free (DROP below)
-             * only decrements 2→1 — the ring holds the other reference. */
-            rte_mbuf_refcnt_update(pkt, 1);
-            if (rte_ring_sp_enqueue(sb->ring, pkt) != 0) {
-                rte_mbuf_refcnt_update(pkt, -1);
+            if (sb->touched && sb->buffering_far_id != far->farId) {
                 meta->action = ONVM_NF_ACTION_DROP;
+                __atomic_fetch_add(&g_sess_buffer_far_conflict_drops, 1,
+                                   __ATOMIC_RELAXED);
                 goto dl_nocp;
             }
-
-            sb->touched = 1;
-            meta->action = ONVM_NF_ACTION_DROP;
+            if (!sb->touched)
+                sb->buffering_far_id = far->farId;
+            sb->is_buffering = 1;
+            if (enqueue_session_packet(sb, pkt, meta, false) < 0 &&
+                !sb->touched)
+                sb->buffering_far_id = 0;
             goto dl_nocp;
+        }
+
+        /* A FORW packet must not overtake packets already buffered for this
+         * FAR. Schedule the old FIFO first, but let the current packet pass
+         * through normal QoS handling before deciding where it waits. */
+        if (far_action == UPDK_FAR_APPLY_ACTION_FORW && sb->touched &&
+            sb->buffering_far_id == far->farId) {
+            sb->is_buffering = 0;
+            mark_session_drain_active(sess_idx);
+            defer_for_order = true;
         }
 
         /* QoS shaping — FORW only, after GTP-U/L2 TX prep is complete.
@@ -1715,12 +1852,19 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             }
         }
 
-        /* Non-BUFF (typically FORW): drain any previously queued packets,
-         * then forward the current packet immediately (no enqueue). */
-        sb->is_buffering = 0;
-        if (sb->touched)
-            drain_session_batch(sess_idx, INLINE_DRAIN_BATCH, nf);
+        /* If normal QoS permits immediate transmission, put this packet behind
+         * the old session backlog. Packets queued or dropped by QoS have
+         * already left through dl_nocp above; the old FIFO still drains first
+         * from the callback. */
+        if (defer_for_order) {
+            enqueue_session_packet(sb, pkt, meta, true);
+            goto dl_nocp;
+        }
 
+        /* No matching session backlog remains, so the current packet can be
+         * forwarded directly after the normal QoS checks above. */
+        if (!sb->touched)
+            sb->is_buffering = 0;
         meta->action = ONVM_NF_ACTION_OUT;
 
         goto dl_nocp;
@@ -1835,9 +1979,31 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
         struct onvm_nf *nf = nf_local_ctx->nf;
         int sess_idx = (int)(uintptr_t)e->arg0;
         if (sess_idx >= 0 && sess_idx < SESS_BUF_MAX_USERS) {
-            g_sess_buf[sess_idx].is_buffering = 0;
-            uint32_t n = drain_session_batch(sess_idx, UINT32_MAX, nf);
-            UTLT_Debug("EVENT drain: sess %d, sent %u pkts\n", sess_idx, n);
+            UpfSessBuf *sb = &g_sess_buf[sess_idx];
+            uint8_t requested =
+                __atomic_exchange_n(&sb->drain_requested, 0,
+                                    __ATOMIC_ACQ_REL);
+
+            if (!requested) {
+                UTLT_Debug("Ignore stale session drain event: sess %d\n",
+                           sess_idx);
+            } else {
+                uint32_t drain_far_id =
+                    __atomic_load_n(&sb->drain_far_id, __ATOMIC_ACQUIRE);
+
+                if (!sb->touched || sb->buffering_far_id == drain_far_id) {
+                    sb->is_buffering = 0;
+                    uint32_t n =
+                        drain_session_batch(sess_idx, UINT32_MAX, nf);
+                    clear_session_drain_active(sess_idx);
+                    UTLT_Debug("EVENT drain: sess %d FAR %u, sent %u pkts\n",
+                               sess_idx, drain_far_id, n);
+                } else {
+                    UTLT_Warning("Ignore session %d drain for FAR %u; FIFO belongs to FAR %u",
+                                 sess_idx, drain_far_id,
+                                 sb->buffering_far_id);
+                }
+            }
         }
         rte_free(e);
         return;
@@ -1860,6 +2026,7 @@ callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
     if (unlikely(!last_p)) last_p = rte_get_tsc_cycles();
     cur_p = rte_get_tsc_cycles();
 
+    drain_ready_session_buffers(nf);
     drain_shaper_queues(nf);
 
     if (unlikely(cur_p - last_p > rte_get_timer_hz())) {
@@ -1867,6 +2034,18 @@ callback_handler(struct onvm_nf_local_ctx *nf_local_ctx) {
         UTLT_Debug("Stats perform: ");
         UTLT_Debug("act out: %d", nf->stats.act_out);
         UTLT_Debug("buffered: %d", nf->stats.tx_buffer);
+        UTLT_Debug("session buffer queued: %" PRIu64,
+                   __atomic_load_n(&g_sess_buffer_queued, __ATOMIC_RELAXED));
+        UTLT_Debug("session buffer drained: %" PRIu64,
+                   __atomic_load_n(&g_sess_buffer_drained, __ATOMIC_RELAXED));
+        UTLT_Debug("session buffer full drops: %" PRIu64,
+                   __atomic_load_n(&g_sess_buffer_full_drops, __ATOMIC_RELAXED));
+        UTLT_Debug("session buffer deferred FORW: %" PRIu64,
+                   __atomic_load_n(&g_sess_buffer_deferred_forw,
+                                   __ATOMIC_RELAXED));
+        UTLT_Debug("session buffer FAR-conflict drops: %" PRIu64,
+                   __atomic_load_n(&g_sess_buffer_far_conflict_drops,
+                                   __ATOMIC_RELAXED));
         UTLT_Debug("shaper queued: %" PRIu64,
                    __atomic_load_n(&g_shaper_queued, __ATOMIC_RELAXED));
         UTLT_Debug("shaper drained: %" PRIu64,

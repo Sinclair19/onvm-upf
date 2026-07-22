@@ -36,6 +36,7 @@
 #include "n4_onvm_pfcp_build.h"
 #include "upf_events.h"
 #include "upf_cls_ctrl.h"
+#include "upf_sess_buf.h"
 
 #include "updk/rule.h"
 #include "updk/rule_pdr.h"
@@ -1366,9 +1367,6 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
 
     //to check the last action
     oldAction = upfFar->applyAction;
-    if (oldAction & PFCP_FAR_APPLY_ACTION_BUFF) {
-         onvm_nflib_send_msg_to_nf(1, NULL);
-    }
 
     UTLT_Assert(_ConvertUpdateFARTlvToRule(upfFar, updateFar) == STATUS_OK,
         return STATUS_ERROR, "Convert FAR TLV To Rule is failed");
@@ -1377,8 +1375,22 @@ Status UpfN4HandleUpdateFar(UpfSession *session, UpdateFAR *updateFar) {
      * UPF-U sees the new FORW action when it processes drained packets. */
     if ((oldAction & PFCP_FAR_APPLY_ACTION_BUFF) &&
         (upfFar->applyAction & PFCP_FAR_APPLY_ACTION_FORW)) {
-         UpfSendEvt1(UPF_U_SERVICE_ID, UPF_EVENT_CLEAR_AND_DRAIN,
-                     (uintptr_t)session->index);
+        int drain_rc;
+
+        if (g_sess_buf && session->index >= 0 &&
+            session->index < SESS_BUF_MAX_USERS) {
+            __atomic_store_n(&g_sess_buf[session->index].drain_far_id,
+                             farID, __ATOMIC_RELEASE);
+            __atomic_store_n(&g_sess_buf[session->index].drain_requested,
+                             1, __ATOMIC_RELEASE);
+        }
+        drain_rc = UpfSendEvt1(UPF_U_SERVICE_ID,
+                               UPF_EVENT_CLEAR_AND_DRAIN,
+                               (uintptr_t)session->index);
+        if (drain_rc < 0) {
+            UTLT_Warning("Failed to notify UPF-U to drain session %d: %d",
+                         session->index, drain_rc);
+        }
     }
 
 #if HANDLE_BUFFER

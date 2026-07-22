@@ -23,8 +23,11 @@ extern "C" {
 typedef struct {
     struct rte_ring *ring;       /* SP/SC ring for DL packets      */
     uint8_t  ring_created;       /* 1 = ring has been allocated     */
-    uint8_t  touched;            /* 1 = has pending pkts since tick */
+    uint8_t  touched;            /* 1 = ring contains pending packets */
     uint8_t  is_buffering;       /* 1 = FAR is BUFF, skip drains   */
+    uint8_t  drain_requested;    /* CP requested BUFF -> FORW drain */
+    uint32_t buffering_far_id;   /* sole FAR owning the current FIFO */
+    uint32_t drain_far_id;       /* FAR named by the CP drain request */
 } UpfSessBuf;
 
 /* Global pointer to the shared UpfSessBuf array (set by UpfSessBufInit) */

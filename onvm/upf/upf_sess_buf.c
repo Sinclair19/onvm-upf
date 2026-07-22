@@ -58,6 +58,9 @@ int UpfSessBufRingCreate(int sess_index) {
     sb->ring_created = 1;
     sb->touched = 0;
     sb->is_buffering = 0;
+    sb->drain_requested = 0;
+    sb->buffering_far_id = 0;
+    sb->drain_far_id = 0;
     return 0;
 }
 
@@ -77,4 +80,7 @@ void UpfSessBufRingDestroy(int sess_index) {
     sb->ring_created = 0;
     sb->touched = 0;
     sb->is_buffering = 0;
+    sb->drain_requested = 0;
+    sb->buffering_far_id = 0;
+    sb->drain_far_id = 0;
 }
