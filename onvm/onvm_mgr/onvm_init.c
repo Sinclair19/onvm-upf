@@ -362,9 +362,14 @@ init_nf_init_cfg_pool(void) {
 static int
 init_port(uint8_t port_num) {
         const uint16_t rx_rings = ONVM_NUM_RX_THREADS;
+        const uint16_t wakeup_lcores = ONVM_NF_SHARE_CORES ? ONVM_NUM_WAKEUP_THREADS : 0;
+        const uint16_t monitor_lcores =
+            ONVM_UPF_U_RX_MONITOR ? ONVM_NUM_UPF_U_RX_MONITOR_THREADS : 0;
+        const uint16_t reserved_lcores =
+            rx_rings + ONVM_NUM_MGR_AUX_THREADS + wakeup_lcores + monitor_lcores;
         uint16_t rx_ring_size = RTE_MP_RX_DESC_DEFAULT;
         /* Set the number of tx_rings equal to the tx threads. This mimics the onvm_mgr tx thread calculation. */
-        const uint16_t tx_rings = rte_lcore_count() - rx_rings - ONVM_NUM_MGR_AUX_THREADS;
+        uint16_t tx_rings;
         uint16_t tx_ring_size = RTE_MP_TX_DESC_DEFAULT;
 
         struct rte_eth_rxconf rxq_conf;
@@ -374,6 +379,13 @@ init_port(uint8_t port_num) {
 
         uint16_t q;
         int retval;
+
+        if (rte_lcore_count() <= reserved_lcores) {
+                RTE_LOG(ERR, APP,
+                        "Not enough lcores to reserve a manager TX thread after RX, auxiliary, wakeup, and monitor threads\n");
+                return -EINVAL;
+        }
+        tx_rings = rte_lcore_count() - reserved_lcores;
 
         printf("Port %u init ... \n", (unsigned)port_num);
         printf("Port %u socket id %u ... \n", (unsigned)port_num, (unsigned)rte_eth_dev_socket_id(port_num));

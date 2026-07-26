@@ -82,6 +82,9 @@ uint8_t ONVM_NF_SHARE_CORES = 0;
 /* global flag for jumbo frames - extern in init.h */
 uint8_t ONVM_USE_JUMBO_FRAMES = 0;
 
+/* global flag for the first-stage UPF-U RX queue monitor - extern in init.h */
+uint8_t ONVM_UPF_U_RX_MONITOR = 0;
+
 /* global var for program name */
 static const char *progname;
 
@@ -130,11 +133,13 @@ parse_app_args(uint8_t max_ports, int argc, char *argv[]) {
             {"stats-out", no_argument, NULL, 's'},       {"stats-sleep-time", no_argument, NULL, 'z'},
             {"time_to_live", no_argument, NULL, 't'},    {"packet_limit", no_argument, NULL, 'l'},
             {"verbocity-level", no_argument, NULL, 'v'}, {"enable_shared_cpu", no_argument, NULL, 'c'},
-            {"jumbo_frames", no_argument, NULL, 'j'}};
+            {"jumbo_frames", no_argument, NULL, 'j'},
+            {"enable-upf-u-wakeup-monitor", no_argument, NULL, 'w'},
+            {NULL, 0, NULL, 0}};
 
         progname = argv[0];
 
-        while ((opt = getopt_long(argc, argvopt, "p:r:n:d:s:t:l:z:v:cj", lgopts, &option_index)) != EOF) {
+        while ((opt = getopt_long(argc, argvopt, "p:r:n:d:s:t:l:z:v:cjw", lgopts, &option_index)) != EOF) {
                 switch (opt) {
                         case 'p':
                                 if (parse_portmask(max_ports, optarg) != 0) {
@@ -199,6 +204,9 @@ parse_app_args(uint8_t max_ports, int argc, char *argv[]) {
                         case 'j':
                                 ONVM_USE_JUMBO_FRAMES = 1;
                                 break;
+                        case 'w':
+                                ONVM_UPF_U_RX_MONITOR = 1;
+                                break;
                         default:
                                 printf("ERROR: Unknown option '%c'\n", opt);
                                 usage();
@@ -214,7 +222,7 @@ parse_app_args(uint8_t max_ports, int argc, char *argv[]) {
 static void
 usage(void) {
         printf(
-            "%s [EAL options] -- -p PORTMASK [-r NUM_SERVICES] [-d DEFAULT_SERVICE] [-s STATS_OUTPUT]\n"
+            "%s [EAL options] -- -p PORTMASK [-r NUM_SERVICES] [-d DEFAULT_SERVICE] [-s STATS_OUTPUT] [-w]\n"
             "\t-p PORTMASK: hexadecimal bitmask of ports to use\n"
             "\t-r NUM_SERVICES: number of unique serivces allowed. defaults to 16 (optional)\n"
             "\t-d DEFAULT_SERVICE: the service to initially receive packets. defaults to 1 (optional)\n"
@@ -224,6 +232,7 @@ usage(void) {
             "\t-l PACKET_LIMIT: how many millions of packets to recieve before exiting (optional)\n"
             "\t-v VERBOCITY_LEVEL: verbocity level of the stats output (optional)\n"
             "\t-c ENABLE_SHARED_CORE: allow the NFs to share a core based on mutex sleep/wakeups (optional)\n"
+            "\t-w ENABLE_UPF_U_WAKEUP_MONITOR: print UPF-U RX queue sizes from a dedicated manager core (optional)\n"
             "\t-j JUMBO_FRAMES: allow the ports to send and receive jumbo frames (optional)\n",
             progname);
 }

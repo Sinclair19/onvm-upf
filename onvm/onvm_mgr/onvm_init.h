@@ -98,6 +98,7 @@
 /* Number of auxiliary threads in manager, 1 reserved for stats */
 #define ONVM_NUM_MGR_AUX_THREADS 1
 #define ONVM_NUM_WAKEUP_THREADS 1  // Enabled when using shared core mode
+#define ONVM_NUM_UPF_U_RX_MONITOR_THREADS 1
 
 /*************************External global variables***************************/
 
@@ -129,6 +130,7 @@ extern uint8_t global_verbosity_level;
 extern struct onvm_configuration *onvm_config;
 extern uint8_t ONVM_NF_SHARE_CORES;
 extern uint8_t ONVM_USE_JUMBO_FRAMES;
+extern uint8_t ONVM_UPF_U_RX_MONITOR;
 
 /* For handling shared core logic */
 extern struct nf_wakeup_info *nf_wakeup_infos;

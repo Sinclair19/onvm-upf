@@ -53,6 +53,7 @@
 #include "onvm_nf.h"
 #include "onvm_pkt.h"
 #include "onvm_stats.h"
+#include "onvm_wakemgr.h"
 
 /****************************Internal Declarations****************************/
 
@@ -298,7 +299,6 @@ wakeup_thread_main(void *arg) {
                 }
         }
 
-        free(wakeup_ctx);
         return 0;
 }
 
@@ -345,7 +345,9 @@ struct queue_mgr *rx_mgr[], struct wakeup_thread_context *wakeup_ctx[]) {
 /*******************************Main function*********************************/
 int
 main(int argc, char *argv[]) {
-        unsigned cur_lcore, rx_lcores, tx_lcores, wakeup_lcores;
+        unsigned cur_lcore, rx_lcores, tx_lcores;
+        unsigned wakeup_lcores = 0;
+        unsigned upf_u_monitor_lcores = 0;
         unsigned nfs_per_tx, nfs_per_wakeup_thread;
         unsigned i;
 
@@ -362,17 +364,21 @@ main(int argc, char *argv[]) {
          * remaining for Tx (subtract wakeup cores if shared core mode is enabled) */
         cur_lcore = rte_lcore_id();
         rx_lcores = ONVM_NUM_RX_THREADS;
-        tx_lcores = rte_lcore_count() - rx_lcores - ONVM_NUM_MGR_AUX_THREADS;
-
-        /* If shared core mode enabled adjust core numbers */
-        if (ONVM_NF_SHARE_CORES) {
+        if (ONVM_NF_SHARE_CORES)
                 wakeup_lcores = ONVM_NUM_WAKEUP_THREADS;
-                tx_lcores -= wakeup_lcores;
-                if (tx_lcores < 1) {
-                        RTE_LOG(INFO, APP, "Not enough cores to enabled shared core support\n");
-                        return -1;
-                }
+
+        if (ONVM_UPF_U_RX_MONITOR)
+                upf_u_monitor_lcores = ONVM_NUM_UPF_U_RX_MONITOR_THREADS;
+
+        if (rte_lcore_count() <=
+            rx_lcores + ONVM_NUM_MGR_AUX_THREADS + wakeup_lcores + upf_u_monitor_lcores) {
+                RTE_LOG(ERR, APP,
+                        "Not enough cores for manager RX, TX, auxiliary, wakeup, and UPF-U monitor threads\n");
+                return -1;
         }
+
+        tx_lcores = rte_lcore_count() - rx_lcores - ONVM_NUM_MGR_AUX_THREADS -
+                    wakeup_lcores - upf_u_monitor_lcores;
 
         onvm_stats_gen_event_info("MGR Start", ONVM_EVENT_WITH_CORE, &cur_lcore);
 
@@ -384,6 +390,9 @@ main(int argc, char *argv[]) {
         RTE_LOG(INFO, APP, "%d cores available for handling TX queues\n", tx_lcores);
         if (ONVM_NF_SHARE_CORES)
                 RTE_LOG(INFO, APP, "%d cores available for handling wakeup\n", wakeup_lcores);
+        if (ONVM_UPF_U_RX_MONITOR)
+                RTE_LOG(INFO, APP, "%d core available for monitoring UPF-U RX queues\n",
+                        upf_u_monitor_lcores);
         RTE_LOG(INFO, APP, "%d cores available for handling stats\n", 1);
 
         /* Evenly assign NFs to TX threads */
@@ -406,7 +415,8 @@ main(int argc, char *argv[]) {
 
         struct queue_mgr *tx_mgr[tx_lcores];
         struct queue_mgr *rx_mgr[rx_lcores];
-        struct wakeup_thread_context *wakeup_ctx[ONVM_NUM_WAKEUP_THREADS];
+        struct wakeup_thread_context *wakeup_ctx[ONVM_NUM_WAKEUP_THREADS] = {NULL};
+        struct onvm_wakemgr_ctx *upf_u_monitor_ctx = NULL;
 
         for (i = 0; i < tx_lcores; i++) {
                 tx_mgr[i] = rte_calloc(NULL, 1, sizeof(struct queue_mgr), RTE_CACHE_LINE_SIZE);
@@ -479,13 +489,35 @@ main(int argc, char *argv[]) {
                         }
                 }
         }
+
+        if (ONVM_UPF_U_RX_MONITOR) {
+                upf_u_monitor_ctx =
+                    rte_calloc(NULL, 1, sizeof(struct onvm_wakemgr_ctx), RTE_CACHE_LINE_SIZE);
+                if (upf_u_monitor_ctx == NULL)
+                        goto onvm_free;
+
+                upf_u_monitor_ctx->keep_running = &worker_keep_running;
+                cur_lcore = rte_get_next_lcore(cur_lcore, 1, 1);
+                if (rte_eal_remote_launch(onvm_wakemgr_main, upf_u_monitor_ctx, cur_lcore) == -EBUSY) {
+                        RTE_LOG(ERR, APP,
+                                "Socket %d, Core %d is already busy, can't use it for the UPF-U RX monitor\n",
+                                rte_socket_id(), cur_lcore);
+                        goto onvm_free;
+                }
+        }
+
         /* Master thread handles statistics and NF management */
         master_thread_main();
+        rte_eal_mp_wait_lcore();
+        rte_free(upf_u_monitor_ctx);
         onvm_main_free(tx_lcores,rx_lcores, tx_mgr, rx_mgr, wakeup_ctx);
         return 0;
 
 onvm_free:
         RTE_LOG(ERR, APP, "Can't allocate required struct.\n");
+        worker_keep_running = 0;
+        rte_eal_mp_wait_lcore();
+        rte_free(upf_u_monitor_ctx);
         onvm_main_free(tx_lcores,rx_lcores, tx_mgr, rx_mgr, wakeup_ctx);
         return -1;
 }
