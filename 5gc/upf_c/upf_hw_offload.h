@@ -390,6 +390,21 @@ upf_send_hw_offload_update_far(UPDK_PDR *pdr, const UPDK_FAR *far)
         msg->ohc_ipv4 = ohc->ipv4;
     }
 
+    /* QER rates — carry MBR/GBR on the BUFF/FORW message so the DPU buffer
+     * allocator has a per-flow cold-start seed at BUFF entry (no DPU-side QoS
+     * cache needed).  Mirrors upf_send_hw_offload_update_qer. */
+    if (pdr->qer) {
+        const UPDK_QER *qer = pdr->qer;
+        if (qer->flags.maximumBitrate) {
+            msg->mbr_ul = qer->maximumBitrate.ul;
+            msg->mbr_dl = qer->maximumBitrate.dl;
+        }
+        if (qer->flags.guaranteedBitrate) {
+            msg->gbr_ul = qer->guaranteedBitrate.ul;
+            msg->gbr_dl = qer->guaranteedBitrate.dl;
+        }
+    }
+
     int rc = onvm_nflib_send_msg_to_nf(HOST_AGENT_SERVICE_ID, msg);
     if (rc < 0) {
         UTLT_Warning("hw_offload_update_far: send failed (rc=%d) "
