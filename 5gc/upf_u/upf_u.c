@@ -74,8 +74,6 @@
 #define SHAPER_DRAIN_BUDGET      128
 #define SHAPER_INLINE_DRAIN_BUDGET 32
 #define SHAPER_CLASS_BURST        16
-#define SHAPER_MAX_QUEUE_DELAY_MS 100
-#define SHAPER_MIN_QUEUE_PKTS     4
 #define SHAPER_MAX_FLOWS_PER_UE  64
 #define SHAPER_MAX_PKTS_PER_FLOW 512
 #define SHAPER_MAX_PKTS_PER_UE   2048
@@ -102,8 +100,15 @@ enum shaper_active_list_id {
     /* QoS scheduling is color-neutral; color remains packet metadata. */
     SHAPER_ACTIVE_GBR_QOS,
     SHAPER_ACTIVE_NON_GBR_QOS,
-    SHAPER_ACTIVE_NQOS,
+    SHAPER_ACTIVE_DEFAULT_NON_GBR,
     SHAPER_ACTIVE_COUNT
+};
+
+enum shaper_service {
+    SHAPER_SERVICE_SESSION_AMBR = 0,
+    SHAPER_SERVICE_GBR_GUARANTEED,
+    SHAPER_SERVICE_GBR_EXCESS,
+    SHAPER_SERVICE_COUNT
 };
 
 struct shaper_flow_key {
@@ -134,6 +139,7 @@ struct shaper_flow {
     uint32_t queued_bytes;
     /* Mutable QER policy, deliberately excluded from the flow identity. */
     bool has_gbr;
+    uint32_t qer_id;
     enum shaper_active_list_id active_list;
     uint64_t last_active_tsc;
     TAILQ_ENTRY(shaper_flow) active_node;
@@ -455,10 +461,11 @@ static inline enum shaper_active_list_id
 shaper_active_list_for_head(const struct shaper_flow *flow) {
     if (flow == NULL || flow->head == NULL)
         return SHAPER_ACTIVE_NONE;
+    if (flow->has_gbr)
+        return SHAPER_ACTIVE_GBR_QOS;
     if (!flow->key.is_qos)
-        return SHAPER_ACTIVE_NQOS;
-    return flow->has_gbr ? SHAPER_ACTIVE_GBR_QOS :
-                           SHAPER_ACTIVE_NON_GBR_QOS;
+        return SHAPER_ACTIVE_DEFAULT_NON_GBR;
+    return SHAPER_ACTIVE_NON_GBR_QOS;
 }
 
 static inline void
@@ -489,16 +496,17 @@ shaper_deactivate_flow(struct ue_shaper *ue, struct shaper_flow *flow) {
 
 static inline void
 shaper_update_flow_policy(struct ue_shaper *ue, struct shaper_flow *flow,
-                          bool has_gbr) {
+                          bool has_gbr, uint32_t qer_id) {
     bool was_active;
 
-    if (flow->has_gbr == has_gbr)
+    if (flow->has_gbr == has_gbr && flow->qer_id == qer_id)
         return;
 
     was_active = flow->active_list != SHAPER_ACTIVE_NONE;
     if (was_active)
         shaper_deactivate_flow(ue, flow);
     flow->has_gbr = has_gbr;
+    flow->qer_id = qer_id;
     if (was_active)
         shaper_activate_flow(ue, flow);
 }
@@ -519,102 +527,65 @@ shaper_count_overflow(enum shaper_pkt_color color) {
         __atomic_fetch_add(&g_shaper_drop_nqos_overflow, 1, __ATOMIC_RELAXED);
 }
 
-static void
-shaper_drop_head_locked(struct ue_shaper *ue, struct shaper_flow *flow) {
-    struct shaper_entry *entry;
-
-    if (ue == NULL || flow == NULL || flow->head == NULL)
-        return;
-
-    entry = flow->head;
-    flow->head = entry->next;
-    if (flow->head == NULL)
-        flow->tail = NULL;
-    flow->queued_pkts--;
-    flow->queued_bytes -= entry->pkt_len;
-    ue->queued_pkts--;
-
-    rte_pktmbuf_free(entry->pkt);
-    shaper_count_overflow(entry->color);
-    shaper_free_entry(entry);
-    __atomic_fetch_add(&g_shaper_drop_flow_queue_full, 1,
-                       __ATOMIC_RELAXED);
-}
-
-static void
-shaper_trim_flow_for_enqueue_locked(struct ue_shaper *ue,
-                                    struct shaper_flow *flow,
-                                    uint32_t pkt_len,
-                                    uint64_t queue_limit_bytes) {
-    bool was_active;
-
-    if (ue == NULL || flow == NULL || flow->queued_pkts == 0)
-        return;
-
-    was_active = flow->active_list != SHAPER_ACTIVE_NONE;
-    if (was_active)
-        shaper_deactivate_flow(ue, flow);
-
-    while (flow->head != NULL &&
-           (flow->queued_pkts >= SHAPER_MAX_PKTS_PER_FLOW ||
-            (uint64_t)flow->queued_bytes + pkt_len > queue_limit_bytes)) {
-        shaper_drop_head_locked(ue, flow);
-    }
-
-    if (flow->head != NULL)
-        shaper_activate_flow(ue, flow);
-}
-
 static inline bool
-shaper_class_has_backlog_locked(const struct ue_shaper *ue,
-                                enum ue_bucket_class bucket_class) {
-    switch (bucket_class) {
-    case UE_BUCKET_GREEN:
-        return ue->active_count[SHAPER_ACTIVE_GBR_QOS] > 0;
-    case UE_BUCKET_YELLOW:
-    case UE_BUCKET_NQOS:
-        return ue->active_count[SHAPER_ACTIVE_GBR_QOS] > 0 ||
-               ue->active_count[SHAPER_ACTIVE_NON_GBR_QOS] > 0 ||
-               ue->active_count[SHAPER_ACTIVE_NQOS] > 0;
-    case UE_BUCKET_COUNT:
+shaper_service_can_fit(int ue_idx, enum shaper_service service,
+                       uint32_t qer_id, uint32_t pkt_len) {
+    switch (service) {
+    case SHAPER_SERVICE_SESSION_AMBR:
+        return sessionAmbrCanFitPacket(ue_idx, pkt_len);
+    case SHAPER_SERVICE_GBR_GUARANTEED:
+        return gbrGuaranteedCanFitPacket(ue_idx, qer_id, pkt_len);
+    case SHAPER_SERVICE_GBR_EXCESS:
+        return gbrExcessCanFitPacket(ue_idx, qer_id, pkt_len);
+    case SHAPER_SERVICE_COUNT:
     default:
         return false;
     }
 }
 
-static inline enum ue_bucket_class
-shaper_bucket_for_packet(bool is_qos, bool has_gbr) {
-    if (!is_qos)
-        return UE_BUCKET_NQOS;
-    if (has_gbr)
-        return UE_BUCKET_GREEN;
-    return UE_BUCKET_YELLOW;
+static inline bool
+shaper_consume_service(int ue_idx, enum shaper_service service,
+                       uint32_t qer_id, uint32_t pkt_len) {
+    switch (service) {
+    case SHAPER_SERVICE_SESSION_AMBR:
+        return consume_session_ambr(ue_idx, pkt_len);
+    case SHAPER_SERVICE_GBR_GUARANTEED:
+        return consume_gbr_guaranteed(ue_idx, qer_id, pkt_len);
+    case SHAPER_SERVICE_GBR_EXCESS:
+        return consume_gbr_excess(ue_idx, qer_id, pkt_len);
+    case SHAPER_SERVICE_COUNT:
+    default:
+        return false;
+    }
 }
 
 static inline bool
-shaper_packet_can_fit(int ue_idx, bool is_qos, bool has_gbr,
+shaper_packet_can_fit(int ue_idx, bool has_gbr, uint32_t qer_id,
                       uint32_t pkt_len) {
-    enum ue_bucket_class bucket_class =
-        shaper_bucket_for_packet(is_qos, has_gbr);
+    if (has_gbr)
+        return gbrExcessCanFitPacket(ue_idx, qer_id, pkt_len);
+    return sessionAmbrCanFitPacket(ue_idx, pkt_len);
+}
 
-    if (ueBucketCanFitPacket(ue_idx, bucket_class, pkt_len))
+static inline bool
+shaper_consume_fast_path(int ue_idx, bool has_gbr, uint32_t qer_id,
+                         uint32_t pkt_len) {
+    if (!has_gbr)
+        return consume_session_ambr(ue_idx, pkt_len);
+    if (consume_gbr_guaranteed(ue_idx, qer_id, pkt_len))
         return true;
-    return is_qos && has_gbr &&
-           ueBucketCanFitPacket(ue_idx, UE_BUCKET_YELLOW, pkt_len);
+    return consume_gbr_excess(ue_idx, qer_id, pkt_len);
 }
 
 static enum shaper_decision
 shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
-                        bool is_qos, bool has_gbr,
+                        bool has_gbr, uint32_t qer_id,
                         enum shaper_pkt_color color,
                         struct rte_mbuf *pkt, uint32_t pkt_len,
                         struct onvm_pkt_meta *meta) {
     struct ue_shaper *ue;
     struct shaper_flow *flow;
     struct shaper_entry *entry;
-    enum ue_bucket_class bucket_class;
-    uint64_t min_queue_bytes;
-    uint64_t queue_limit_bytes;
 
     if (unlikely(pkt == NULL || key == NULL || g_shaper_entry_pool == NULL)) {
         meta->action = ONVM_NF_ACTION_DROP;
@@ -628,29 +599,20 @@ shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
         __atomic_fetch_add(&g_shaper_drop_invalid, 1, __ATOMIC_RELAXED);
         return SHAPER_DROP;
     }
-    bucket_class = shaper_bucket_for_packet(is_qos, has_gbr);
-    min_queue_bytes = (uint64_t)pkt_len * SHAPER_MIN_QUEUE_PKTS;
-
-    if (!shaper_packet_can_fit(ue_idx, is_qos, has_gbr, pkt_len)) {
+    if (!shaper_packet_can_fit(ue_idx, has_gbr, qer_id, pkt_len)) {
         meta->action = ONVM_NF_ACTION_DROP;
         __atomic_fetch_add(&g_shaper_drop_invalid, 1, __ATOMIC_RELAXED);
         return SHAPER_DROP;
     }
-
-    queue_limit_bytes =
-        ueShaperQueueLimitBytes(ue_idx, is_qos,
-                                SHAPER_MAX_QUEUE_DELAY_MS,
-                                min_queue_bytes);
 
     ue = &g_ue_shaper[ue_idx];
     rte_spinlock_lock(&ue->lock);
 
     flow = shaper_lookup_flow(ue, key, false);
     if (flow != NULL)
-        shaper_update_flow_policy(ue, flow, has_gbr);
+        shaper_update_flow_policy(ue, flow, has_gbr, qer_id);
     if (flow == NULL &&
-        !shaper_class_has_backlog_locked(ue, bucket_class) &&
-        consumeUeBucketTokens(ue_idx, bucket_class, pkt_len)) {
+        shaper_consume_fast_path(ue_idx, has_gbr, qer_id, pkt_len)) {
         rte_spinlock_unlock(&ue->lock);
         return SHAPER_PASS;
     }
@@ -665,9 +627,7 @@ shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
         shaper_count_overflow(color);
         return SHAPER_DROP;
     }
-    shaper_update_flow_policy(ue, flow, has_gbr);
-    shaper_trim_flow_for_enqueue_locked(ue, flow, pkt_len,
-                                        queue_limit_bytes);
+    shaper_update_flow_policy(ue, flow, has_gbr, qer_id);
     if (flow->queued_pkts >= SHAPER_MAX_PKTS_PER_FLOW) {
         rte_spinlock_unlock(&ue->lock);
         meta->action = ONVM_NF_ACTION_DROP;
@@ -727,8 +687,8 @@ shape_or_enqueue_packet(int ue_idx, const struct shaper_flow_key *key,
 static bool
 shaper_drain_one_from_list_locked(int ue_idx,
                                   enum shaper_active_list_id list_id,
-                                  enum ue_bucket_class bucket_class,
-                                  enum ue_bucket_class alternate_bucket_class,
+                                  enum shaper_service service,
+                                  enum shaper_service alternate_service,
                                   struct rte_mbuf **tx_buf,
                                   uint32_t *nb_tx,
                                   struct onvm_configuration *onvm_config) {
@@ -750,10 +710,11 @@ shaper_drain_one_from_list_locked(int ue_idx,
             continue;
         }
 
-        if (!ueBucketCanFitPacket(ue_idx, bucket_class, entry->pkt_len)) {
-            if (alternate_bucket_class < UE_BUCKET_COUNT &&
-                ueBucketCanFitPacket(ue_idx, alternate_bucket_class,
-                                     entry->pkt_len)) {
+        if (!shaper_service_can_fit(ue_idx, service, flow->qer_id,
+                                    entry->pkt_len)) {
+            if (alternate_service < SHAPER_SERVICE_COUNT &&
+                shaper_service_can_fit(ue_idx, alternate_service,
+                                       flow->qer_id, entry->pkt_len)) {
                 shaper_activate_flow(ue, flow);
                 continue;
             }
@@ -773,7 +734,8 @@ shaper_drain_one_from_list_locked(int ue_idx,
             continue;
         }
 
-        if (!consumeUeBucketTokens(ue_idx, bucket_class, entry->pkt_len)) {
+        if (!shaper_consume_service(ue_idx, service, flow->qer_id,
+                                    entry->pkt_len)) {
             shaper_activate_flow(ue, flow);
             continue;
         }
@@ -808,8 +770,8 @@ shaper_drain_one_from_list_locked(int ue_idx,
 static uint32_t
 shaper_drain_service_locked(int ue_idx,
                             enum shaper_active_list_id list_id,
-                            enum ue_bucket_class bucket_class,
-                            enum ue_bucket_class alternate_bucket_class,
+                            enum shaper_service service,
+                            enum shaper_service alternate_service,
                             struct rte_mbuf **tx_buf,
                             uint32_t *nb_tx,
                             struct onvm_configuration *onvm_config,
@@ -819,8 +781,8 @@ shaper_drain_service_locked(int ue_idx,
     while (sent < budget &&
            g_ue_shaper[ue_idx].active_count[list_id] > 0) {
         if (!shaper_drain_one_from_list_locked(ue_idx, list_id,
-                                               bucket_class,
-                                               alternate_bucket_class,
+                                               service,
+                                               alternate_service,
                                                tx_buf, nb_tx,
                                                onvm_config))
             break;
@@ -838,7 +800,8 @@ shaper_drain_gbr_locked(int ue_idx, struct rte_mbuf **tx_buf,
     /* Head color does not affect guaranteed service. A yellow head in a
      * GBR-bearing flow must not strand that flow behind the excess bucket. */
     return shaper_drain_service_locked(ue_idx, SHAPER_ACTIVE_GBR_QOS,
-                                       UE_BUCKET_GREEN, UE_BUCKET_YELLOW,
+                                       SHAPER_SERVICE_GBR_GUARANTEED,
+                                       SHAPER_SERVICE_GBR_EXCESS,
                                        tx_buf, nb_tx, onvm_config, budget);
 }
 
@@ -848,8 +811,8 @@ shaper_next_excess_list(enum shaper_active_list_id list_id) {
     case SHAPER_ACTIVE_GBR_QOS:
         return SHAPER_ACTIVE_NON_GBR_QOS;
     case SHAPER_ACTIVE_NON_GBR_QOS:
-        return SHAPER_ACTIVE_NQOS;
-    case SHAPER_ACTIVE_NQOS:
+        return SHAPER_ACTIVE_DEFAULT_NON_GBR;
+    case SHAPER_ACTIVE_DEFAULT_NON_GBR:
     case SHAPER_ACTIVE_NONE:
     case SHAPER_ACTIVE_COUNT:
     default:
@@ -857,10 +820,10 @@ shaper_next_excess_list(enum shaper_active_list_id list_id) {
     }
 }
 
-static inline enum ue_bucket_class
-shaper_excess_bucket_for_list(enum shaper_active_list_id list_id) {
-    return list_id == SHAPER_ACTIVE_NQOS ?
-           UE_BUCKET_NQOS : UE_BUCKET_YELLOW;
+static inline enum shaper_service
+shaper_excess_service_for_list(enum shaper_active_list_id list_id) {
+    return list_id == SHAPER_ACTIVE_GBR_QOS ?
+           SHAPER_SERVICE_GBR_EXCESS : SHAPER_SERVICE_SESSION_AMBR;
 }
 
 static uint32_t
@@ -874,26 +837,26 @@ shaper_drain_excess_locked(int ue_idx, struct rte_mbuf **tx_buf,
     while (sent < budget &&
            (ue->active_count[SHAPER_ACTIVE_GBR_QOS] > 0 ||
             ue->active_count[SHAPER_ACTIVE_NON_GBR_QOS] > 0 ||
-            ue->active_count[SHAPER_ACTIVE_NQOS] > 0)) {
+            ue->active_count[SHAPER_ACTIVE_DEFAULT_NON_GBR] > 0)) {
         uint32_t n = 0;
 
         for (uint32_t attempt = 0; attempt < 3 && n == 0; attempt++) {
             enum shaper_active_list_id list_id = ue->next_excess_list;
-            enum ue_bucket_class bucket_class;
-            enum ue_bucket_class alternate_bucket_class;
+            enum shaper_service service;
+            enum shaper_service alternate_service;
 
             ue->next_excess_list = shaper_next_excess_list(list_id);
             if (ue->active_count[list_id] == 0)
                 continue;
 
-            bucket_class = shaper_excess_bucket_for_list(list_id);
+            service = shaper_excess_service_for_list(list_id);
             /* A GBR flow that cannot use excess remains eligible to wait for
              * guaranteed tokens. Other classes have no alternate bucket. */
-            alternate_bucket_class =
+            alternate_service =
                 list_id == SHAPER_ACTIVE_GBR_QOS ?
-                UE_BUCKET_GREEN : UE_BUCKET_COUNT;
-            n = shaper_drain_service_locked(ue_idx, list_id, bucket_class,
-                                            alternate_bucket_class, tx_buf,
+                SHAPER_SERVICE_GBR_GUARANTEED : SHAPER_SERVICE_COUNT;
+            n = shaper_drain_service_locked(ue_idx, list_id, service,
+                                            alternate_service, tx_buf,
                                             nb_tx, onvm_config, 1);
         }
         if (n == 0)
@@ -1002,33 +965,46 @@ drain_shaper_queues(struct onvm_nf *nf) {
     return drain_shaper_queues_budget(nf, SHAPER_DRAIN_BUDGET);
 }
 
+static uint32_t
+shaper_flush_ue(int ue_idx) {
+    struct ue_shaper *ue;
+    uint32_t flushed = 0;
+
+    if (ue_idx < 0 || ue_idx >= MAX_UE)
+        return 0;
+
+    ue = &g_ue_shaper[ue_idx];
+    rte_spinlock_lock(&ue->lock);
+    for (int flow_idx = 0; flow_idx < SHAPER_MAX_FLOWS_PER_UE; flow_idx++) {
+        struct shaper_flow *flow = &ue->flows[flow_idx];
+        struct shaper_entry *entry = flow->head;
+
+        while (entry != NULL) {
+            struct shaper_entry *next = entry->next;
+            if (entry->pkt != NULL)
+                rte_pktmbuf_free(entry->pkt);
+            shaper_free_entry(entry);
+            entry = next;
+            flushed++;
+        }
+        memset(flow, 0, sizeof(*flow));
+    }
+    ue->queued_pkts = 0;
+    ue->next_excess_list = SHAPER_ACTIVE_GBR_QOS;
+    for (int list_id = 0; list_id < SHAPER_ACTIVE_COUNT; list_id++) {
+        TAILQ_INIT(&ue->active[list_id]);
+        ue->active_count[list_id] = 0;
+    }
+    shaper_clear_ue_active(ue_idx);
+    rte_spinlock_unlock(&ue->lock);
+    return flushed;
+}
+
 static void
 shaper_cleanup(void) {
-    for (int ue_idx = 0; ue_idx < MAX_UE; ue_idx++) {
-        struct ue_shaper *ue = &g_ue_shaper[ue_idx];
+    for (int ue_idx = 0; ue_idx < MAX_UE; ue_idx++)
+        shaper_flush_ue(ue_idx);
 
-        rte_spinlock_lock(&ue->lock);
-        for (int flow_idx = 0; flow_idx < SHAPER_MAX_FLOWS_PER_UE; flow_idx++) {
-            struct shaper_flow *flow = &ue->flows[flow_idx];
-            struct shaper_entry *entry = flow->head;
-
-            while (entry != NULL) {
-                struct shaper_entry *next = entry->next;
-                if (entry->pkt != NULL)
-                    rte_pktmbuf_free(entry->pkt);
-                shaper_free_entry(entry);
-                entry = next;
-            }
-            memset(flow, 0, sizeof(*flow));
-        }
-        ue->queued_pkts = 0;
-        ue->next_excess_list = SHAPER_ACTIVE_GBR_QOS;
-        for (int list_id = 0; list_id < SHAPER_ACTIVE_COUNT; list_id++) {
-            TAILQ_INIT(&ue->active[list_id]);
-            ue->active_count[list_id] = 0;
-        }
-        rte_spinlock_unlock(&ue->lock);
-    }
     for (uint32_t word_idx = 0; word_idx < SHAPER_UE_BITMAP_WORDS; word_idx++)
         __atomic_store_n(&g_shaper_active_ue_bitmap[word_idx], 0,
                          __ATOMIC_RELEASE);
@@ -1146,11 +1122,6 @@ dl_qos_packet_len(struct rte_mbuf *pkt, const struct rte_ipv4_hdr *iph) {
     return l4_payload_len;
 }
 
-static inline uint64_t
-saturating_add_u64(uint64_t lhs, uint64_t rhs) {
-    return UINT64_MAX - lhs < rhs ? UINT64_MAX : lhs + rhs;
-}
-
 UPDK_PDR *
 GetPdrByUeIpAddress(struct rte_mbuf *pkt, uint32_t ue_ip)
 {
@@ -1254,122 +1225,112 @@ GetPdrByTeid(struct rte_mbuf *pkt, const gtp_parse_result_t *gtp_info) {
     return pdr;
 }
 
+struct session_ambr_discovery {
+    uint64_t rate;
+    bool found;
+    bool conflicting_rates;
+};
+
+static inline bool
+DlQerHasGbr(const UPDK_QER *qer) {
+    return qer != NULL && qer->flags.guaranteedBitrate &&
+           qer->guaranteedBitrate.dl > 0;
+}
+
 static inline void
-AccumulateQerDlRates(const UPDK_QER *q, uint64_t *ambr64,
-                     uint64_t *gbr64, uint64_t *mbr64,
-                     bool *has_gbr_qer)
-{
-    if (!q || !q->flags.maximumBitrate)
+ObserveNonGbrSessionAmbr(const UPDK_QER *qer,
+                         struct session_ambr_discovery *discovery) {
+    uint64_t rate;
+
+    if (qer == NULL || discovery == NULL || !qer->flags.maximumBitrate ||
+        DlQerHasGbr(qer))
         return;
 
-    if (q->flags.guaranteedBitrate) {
-        *has_gbr_qer = true;
-        *gbr64 = saturating_add_u64(*gbr64, q->guaranteedBitrate.dl);
-        *mbr64 = saturating_add_u64(*mbr64, q->maximumBitrate.dl);
-        return;
-    }
-
-    if (q->maximumBitrate.dl > *ambr64)
-        *ambr64 = q->maximumBitrate.dl;
+    rate = qer->maximumBitrate.dl;
+    if (discovery->found && discovery->rate != rate)
+        discovery->conflicting_rates = true;
+    if (!discovery->found || rate > discovery->rate)
+        discovery->rate = rate;
+    discovery->found = true;
 }
 
 static inline bool
-GetQerRatesFromSession(UpfSession *session, uint64_t *ambr64,
-                       uint64_t *gbr64, uint64_t *mbr64,
-                       bool *has_gbr_qer)
-{
-    list_iterator_t *it;
+DiscoverSessionAmbrFromSession(UpfSession *session,
+                               struct session_ambr_discovery *discovery) {
     list_node_t *node;
-    bool found = false;
 
-    if (!session || !session->qer_list)
+    if (!session || !session->qer_list || discovery == NULL)
         return false;
 
-    it = list_iterator_new(session->qer_list, LIST_HEAD);
-    if (!it)
-        return false;
-
-    while ((node = list_iterator_next(it)) != NULL) {
+    for (node = session->qer_list->head; node != NULL; node = node->next) {
         const UPDK_QER *q = (const UPDK_QER *)node->val;
-        if (!q || !q->flags.maximumBitrate)
-            continue;
-
-        found = true;
-        AccumulateQerDlRates(q, ambr64, gbr64, mbr64, has_gbr_qer);
+        ObserveNonGbrSessionAmbr(q, discovery);
     }
 
-    list_iterator_destroy(it);
-    return found;
+    return discovery->found;
 }
 
-static inline bool
-GetQerRatesFromPdr(const UPDK_PDR *pdr, uint64_t *ambr64,
-                   uint64_t *gbr64, uint64_t *mbr64,
-                   bool *has_gbr_qer)
-{
-    bool found = false;
-
-    if (!pdr || pdr->qer_count == 0)
-        return false;
+static inline void
+DiscoverSessionAmbrFromPdr(const UPDK_PDR *pdr,
+                           struct session_ambr_discovery *discovery) {
+    if (!pdr || discovery == NULL || pdr->qer_count == 0)
+        return;
 
     int n = (int)pdr->qer_count;
     if (n > 2) n = 2; /* safety; struct currently supports 2 */
 
     for (int i = 0; i < n; i++) {
-        const UPDK_QER *q = pdr->qers[i];
-        if (!q || !q->flags.maximumBitrate)
-            continue;
-
-        found = true;
-        AccumulateQerDlRates(q, ambr64, gbr64, mbr64, has_gbr_qer);
+        ObserveNonGbrSessionAmbr(pdr->qers[i], discovery);
     }
-
-    return found;
 }
 
-/* Populate UE table from the owning session when possible. The session-level
- * non-GBR QER carries AMBR; GBR-bearing QERs carry QoS flow GBR/MBR. */
+/* Refresh the one session bucket and the selected GBR QER state observed by
+ * this packet. The deployment contract maps one UE IPv4 address to one PDU
+ * session, so the UE table index is also the session shaper index. */
 static inline int
-GetQerByUEIpAddressFromPdr(uint32_t ue_ip, UpfSession *session,
-                           const UPDK_PDR *pdr, const char *ip_str)
-{
-    if ((!session || !session->qer_list) && (!pdr || pdr->qer_count == 0)) {
-        UTLT_Trace("UE %s: No PDR or PDR has no QERs, skip UE table entry",
+ConfigureDlShaperForPdr(uint32_t ue_ip, UpfSession *session,
+                        const UPDK_PDR *pdr, const char *ip_str) {
+    struct session_ambr_discovery discovery = {0};
+    const UPDK_QER *selected_qer;
+    int ue_idx;
+
+    if (pdr == NULL || pdr->qer == NULL) {
+        UTLT_Trace("UE %s: matched PDR has no selected QER",
                    ip_str ? ip_str : "<unknown>");
         return -1;
     }
 
-    uint64_t ambr64 = 0;
-    uint64_t gbr64  = 0;
-    uint64_t mbr64  = 0;
-    bool has_gbr_qer = false;
+    if (!DiscoverSessionAmbrFromSession(session, &discovery))
+        DiscoverSessionAmbrFromPdr(pdr, &discovery);
 
-    if (!GetQerRatesFromSession(session, &ambr64, &gbr64, &mbr64,
-                                &has_gbr_qer)) {
-        GetQerRatesFromPdr(pdr, &ambr64, &gbr64, &mbr64, &has_gbr_qer);
-    }
-    if (ambr64 == 0 && mbr64 > 0)
-        ambr64 = mbr64;
-
-    if (ambr64 == 0) {
-        UTLT_Trace("UE %s: no DL MBR across PDR QERs, skip UE table entry",
-                   ip_str ? ip_str : "<unknown>");
+    ue_idx = findIndexByUeIpAddress(ue_ip);
+    if (ue_idx < 0) {
+        ue_idx = addEntrybyUeIp(ue_ip, discovery.rate,
+                                discovery.conflicting_rates);
+    } else if (!refreshUeSessionAmbr(ue_idx, discovery.rate,
+                                     discovery.conflicting_rates)) {
         return -1;
     }
+    if (ue_idx < 0)
+        return -1;
 
-    /* Clamp PFCP 64-bit rates into 32-bit UE table fields */
-    uint32_t ambr = (ambr64 > UINT32_MAX) ? UINT32_MAX : (uint32_t)ambr64;
-    uint32_t gbr  = (gbr64  > UINT32_MAX) ? UINT32_MAX : (uint32_t)gbr64;
-    uint32_t mbr  = (mbr64  > UINT32_MAX) ? UINT32_MAX : (uint32_t)mbr64;
+    selected_qer = pdr->qer;
+    if (!DlQerHasGbr(selected_qer))
+        return ue_idx;
 
-    if (!has_gbr_qer)
-        mbr = 0;
-    if (mbr && gbr > mbr) gbr = mbr;
+    if (!selected_qer->flags.maximumBitrate ||
+        selected_qer->maximumBitrate.dl == 0) {
+        UTLT_Warning("UE %s GBR QER %u has no nonzero DL MFBR",
+                     ip_str ? ip_str : "<unknown>", selected_qer->qerId);
+        return -1;
+    }
+    if (!refreshUeGbrQer(ue_idx, selected_qer->qerId,
+                         QERGetQFI(selected_qer),
+                         selected_qer->guaranteedBitrate.dl,
+                         selected_qer->maximumBitrate.dl))
+        return -1;
 
-    UTLT_Warning("Add UE IP: %s, AMBR: %u GBR: %u, MBR: %u",
-                 ip_str ? ip_str : "<unknown>", ambr, gbr, mbr);
-
-    return addEntrybyUeIp(ue_ip, ambr, gbr, mbr);
+    return ue_idx;
 }
 
 
@@ -1598,6 +1559,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
     uint32_t ue_key = 0;
     struct shaper_flow_key dl_flow_key = {0};
     bool dl_flow_has_gbr = false;
+    uint32_t dl_qer_id = 0;
 
     /* char *src_address = convertToIpAddressString(iph->src_addr);
     UTLT_Info("Src IP is %s\n", src_address);
@@ -1642,18 +1604,17 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
 
     if (is_dl) {
         ue_key = rte_cpu_to_be_32(iph->dst_addr);
-        ue_idx = findIndexByUeIpAddress(ue_key);
-        if (ue_idx < 0) {
-            ue_idx = GetQerByUEIpAddressFromPdr(ue_key, owner_session, pdr,
-                                                convertToIpAddressString(iph->dst_addr));
-        }
+        ue_idx = ConfigureDlShaperForPdr(
+            ue_key, owner_session, pdr,
+            convertToIpAddressString(iph->dst_addr));
         if (!build_dl_shaper_flow_key(pkt, pdr, ue_key, pdr->has_fd,
                                       &dl_flow_key)) {
             UTLT_Error("Failed to build DL shaper flow key");
             meta->action = ONVM_NF_ACTION_DROP;
             return 0;
         }
-        dl_flow_has_gbr = pdr->has_fd && dl_qos_flow_has_gbr(pdr);
+        dl_flow_has_gbr = dl_qos_flow_has_gbr(pdr);
+        dl_qer_id = pdr->qer != NULL ? pdr->qer->qerId : 0;
     }
 
     rte_pktmbuf_adj(pkt, sizeof(struct rte_ether_hdr));
@@ -1760,11 +1721,11 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
             }
 
             int color_result = 0;
-            bool isQos = false;
+            enum shaper_pkt_color shaper_color =
+                SHAPER_COLOR_NQOS;
             uint64_t curr_time = rte_get_tsc_cycles();
 
             if (pdr->has_fd) {
-                isQos = true;
                 int ft_idx = ftSearch(pdr->meter_key);
                 struct rte_meter_trtcm_profile *trtcm_profile;
                 if (unlikely(ft_idx < 0 || ft_idx >= (int)APP_FLOWS_MAX)) {
@@ -1793,9 +1754,6 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 meta->action = ONVM_NF_ACTION_OUT;
                 if (trtcmPolicer(meta, color_result) > 0)
                     UTLT_Error("trTCM Policer error");
-            }
-
-            if (isQos) {
                 if (meta->flags == RTE_COLOR_RED) {
                     meta->action = ONVM_NF_ACTION_DROP;
                     __atomic_fetch_add(&g_shaper_drop_red, 1, __ATOMIC_RELAXED);
@@ -1803,24 +1761,18 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_
                 }
                 if (meta->flags == RTE_COLOR_GREEN ||
                     meta->flags == RTE_COLOR_YELLOW) {
-                    enum shaper_pkt_color color =
-                        (meta->flags == RTE_COLOR_GREEN) ?
-                        SHAPER_COLOR_GREEN : SHAPER_COLOR_YELLOW;
-                    enum shaper_decision decision =
-                        shape_or_enqueue_packet(ue_idx, &dl_flow_key, true,
-                                                dl_flow_has_gbr, color, pkt,
-                                                cal_pktlen, meta);
-                    if (decision != SHAPER_PASS)
-                        goto dl_nocp;
+                    shaper_color = (meta->flags == RTE_COLOR_GREEN) ?
+                                   SHAPER_COLOR_GREEN :
+                                   SHAPER_COLOR_YELLOW;
                 }
-            } else {
-                enum shaper_decision decision =
-                    shape_or_enqueue_packet(ue_idx, &dl_flow_key, false,
-                                            false, SHAPER_COLOR_NQOS, pkt,
-                                            cal_pktlen, meta);
-                if (decision != SHAPER_PASS)
-                    goto dl_nocp;
             }
+
+            enum shaper_decision decision =
+                shape_or_enqueue_packet(ue_idx, &dl_flow_key,
+                                        dl_flow_has_gbr, dl_qer_id,
+                                        shaper_color, pkt, cal_pktlen, meta);
+            if (decision != SHAPER_PASS)
+                goto dl_nocp;
         }
 
         /* Non-BUFF (typically FORW): drain any previously queued packets,
@@ -1934,6 +1886,18 @@ msg_handler(void *msg_data, struct onvm_nf_local_ctx *nf_local_ctx) {
           (void*)(g_upf_cls_ctrl ? g_upf_cls_ctrl->active : NULL),
           (g_upf_cls_ctrl ? g_upf_cls_ctrl->version : 0));
 
+        rte_free(e);
+        return;
+    }
+
+    if (e && (uint32_t)e->type == UPF_EVENT_SHAPER_SESSION_REMOVE) {
+        uint32_t ue_ip = (uint32_t)e->arg0;
+        int ue_idx = findIndexByUeIpAddress(ue_ip);
+        uint32_t flushed = ue_idx >= 0 ? shaper_flush_ue(ue_idx) : 0;
+        bool removed = removeEntrybyUeIp(ue_ip);
+
+        UTLT_Info("Shaper session remove: UE %u index %d, flushed %u packets, rate state %s",
+                  ue_ip, ue_idx, flushed, removed ? "removed" : "not found");
         rte_free(e);
         return;
     }

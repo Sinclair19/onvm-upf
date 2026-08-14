@@ -13,6 +13,7 @@
 enum {
         UPF_EVENT_SET_BUFFER       = 0xA0,
         UPF_EVENT_CLEAR_AND_DRAIN  = 0xA1,
+        UPF_EVENT_SHAPER_SESSION_REMOVE = 0xA2,
         EVT_CLS_GC_REQ = 0x4201,
         EVT_CLS_GC_ACK = 0x4202,
 };
@@ -29,4 +30,3 @@ uint16_t UpfSelectWorkerServiceIdRoundRobin(void);
 uint16_t UpfSelectWorkerServiceIdByTeid(uint32_t teid);
 uint16_t UpfBroadcastEvt1ToWorkers(uint32_t type, uintptr_t a0);
 uint16_t UpfBroadcastEvt2ToWorkers(uint32_t type, uintptr_t a0, uintptr_t a1);
-

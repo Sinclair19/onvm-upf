@@ -29,6 +29,7 @@
 
 #define APP_FLOWS_MAX 256
 #define MAX_UE 256 // Max number of UEs
+#define SHAPER_MAX_GBR_QERS_PER_UE 16
 
 /* Flow Separation*/
 struct flow_entry {
@@ -54,21 +55,22 @@ struct tb_config {
     uint16_t used;
 };
 
-enum ue_bucket_class {
-    UE_BUCKET_GREEN = 0,
-    UE_BUCKET_YELLOW,
-    UE_BUCKET_NQOS,
-    UE_BUCKET_COUNT
+struct gbr_qer_tb {
+    bool used;
+    uint32_t qer_id;
+    uint8_t qfi;
+    uint64_t gfbr;
+    uint64_t mfbr;
+    struct tb_config gfbr_tb;
+    struct tb_config mfbr_tb;
 };
 
 struct ue_tb {
     uint32_t ue_ip;
-    uint32_t ue_ambr;
-    uint32_t ue_gbr;
-    uint32_t ue_mbr;
-    struct tb_config ue_green_tb_params;
-    struct tb_config ue_excess_tb_params;
-    struct tb_config ue_yellow_cap_tb_params;
+    uint64_t session_ambr;
+    bool session_ambr_conflict;
+    struct tb_config session_ambr_tb;
+    struct gbr_qer_tb gbr_qers[SHAPER_MAX_GBR_QERS_PER_UE];
 };
 
 extern flow_entry_t iPFlows[APP_FLOWS_MAX];
@@ -110,19 +112,36 @@ ftSearch(uint32_t subnet);
 int
 findIndexByUeIpAddress(uint32_t ue_ip);
 
-void
-updateTokenbyIndex(int index);
+bool
+refreshUeSessionAmbr(int index, uint64_t session_ambr, bool conflicting_rates);
 
 bool
-ueBucketCanFitPacket(int index, enum ue_bucket_class bucket_class, uint32_t pkt_len);
+refreshUeGbrQer(int index, uint32_t qer_id, uint8_t qfi,
+                uint64_t gfbr, uint64_t mfbr);
 
 bool
-consumeUeBucketTokens(int index, enum ue_bucket_class bucket_class, uint32_t pkt_len);
+sessionAmbrCanFitPacket(int index, uint32_t pkt_len);
 
-uint64_t
-ueShaperQueueLimitBytes(int index, bool is_qos, uint32_t delay_ms, uint64_t min_bytes);
+bool
+gbrGuaranteedCanFitPacket(int index, uint32_t qer_id, uint32_t pkt_len);
+
+bool
+gbrExcessCanFitPacket(int index, uint32_t qer_id, uint32_t pkt_len);
+
+bool
+consume_session_ambr(int index, uint32_t pkt_len);
+
+bool
+consume_gbr_guaranteed(int index, uint32_t qer_id, uint32_t pkt_len);
+
+bool
+consume_gbr_excess(int index, uint32_t qer_id, uint32_t pkt_len);
 
 int
-addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr, uint32_t ue_mbr);
+addEntrybyUeIp(uint32_t ue_ip, uint64_t session_ambr,
+               bool conflicting_rates);
+
+bool
+removeEntrybyUeIp(uint32_t ue_ip);
 
 #endif

@@ -21,6 +21,7 @@
 #include "utlt_debug.h"
 #include "upf_u_config.h"
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -228,28 +229,16 @@ initUeTable() {
         uint64_t now = rte_get_tsc_cycles();
 
         rte_spinlock_init(&ue_tb_locks[i]);
-        ue_table[i].ue_ip = 0;
-        ue_table[i].ue_ambr = 0;
-        ue_table[i].ue_gbr = 0;
-        ue_table[i].ue_mbr = 0;
-
-        ue_table[i].ue_green_tb_params.tb_rate = 0;
-        ue_table[i].ue_green_tb_params.tb_depth = 0;
-        ue_table[i].ue_green_tb_params.tb_tokens = 0;
-        ue_table[i].ue_green_tb_params.last_cycle = now;
-        ue_table[i].ue_green_tb_params.cur_cycles = now;
-
-        ue_table[i].ue_excess_tb_params.tb_rate = 0;
-        ue_table[i].ue_excess_tb_params.tb_depth = 0;
-        ue_table[i].ue_excess_tb_params.tb_tokens = 0;
-        ue_table[i].ue_excess_tb_params.last_cycle = now;
-        ue_table[i].ue_excess_tb_params.cur_cycles = now;
-
-        ue_table[i].ue_yellow_cap_tb_params.tb_rate = 0;
-        ue_table[i].ue_yellow_cap_tb_params.tb_depth = 0;
-        ue_table[i].ue_yellow_cap_tb_params.tb_tokens = 0;
-        ue_table[i].ue_yellow_cap_tb_params.last_cycle = now;
-        ue_table[i].ue_yellow_cap_tb_params.cur_cycles = now;
+        memset(&ue_table[i], 0, sizeof(ue_table[i]));
+        ue_table[i].session_ambr_tb.last_cycle = now;
+        ue_table[i].session_ambr_tb.cur_cycles = now;
+        for (int qer_idx = 0; qer_idx < SHAPER_MAX_GBR_QERS_PER_UE;
+             qer_idx++) {
+            ue_table[i].gbr_qers[qer_idx].gfbr_tb.last_cycle = now;
+            ue_table[i].gbr_qers[qer_idx].gfbr_tb.cur_cycles = now;
+            ue_table[i].gbr_qers[qer_idx].mfbr_tb.last_cycle = now;
+            ue_table[i].gbr_qers[qer_idx].mfbr_tb.cur_cycles = now;
+        }
     }
 }
 
@@ -267,27 +256,29 @@ ueHashSetInUse(int idx, bool in_use) {
 }
 
 static inline uint64_t
-shaper_bucket_depth(uint32_t rate_kbps) {
-    uint64_t depth_bytes;
+shaper_bucket_depth(uint64_t rate_kbps) {
+    __uint128_t depth_bytes;
 
     if (rate_kbps == 0)
         return 0;
 
-    depth_bytes = ((uint64_t)rate_kbps * TOKEN_BUCKET_BURST_MS + 7) / 8;
-    return depth_bytes < MIN_TOKEN_BUCKET_DEPTH ?
-           MIN_TOKEN_BUCKET_DEPTH : depth_bytes;
+    depth_bytes = ((__uint128_t)rate_kbps * TOKEN_BUCKET_BURST_MS + 7) / 8;
+    if (depth_bytes < MIN_TOKEN_BUCKET_DEPTH)
+        return MIN_TOKEN_BUCKET_DEPTH;
+    return depth_bytes > UINT64_MAX ? UINT64_MAX : (uint64_t)depth_bytes;
 }
 
 static inline uint64_t
-trtcm_bucket_depth(uint32_t rate_kbps) {
-    uint64_t depth_bytes;
+trtcm_bucket_depth(uint64_t rate_kbps) {
+    __uint128_t depth_bytes;
 
     if (rate_kbps == 0)
         return MIN_TOKEN_BUCKET_DEPTH;
 
-    depth_bytes = ((uint64_t)rate_kbps * TRTCM_BURST_MS + 7) / 8;
-    return depth_bytes < MIN_TOKEN_BUCKET_DEPTH ?
-           MIN_TOKEN_BUCKET_DEPTH : depth_bytes;
+    depth_bytes = ((__uint128_t)rate_kbps * TRTCM_BURST_MS + 7) / 8;
+    if (depth_bytes < MIN_TOKEN_BUCKET_DEPTH)
+        return MIN_TOKEN_BUCKET_DEPTH;
+    return depth_bytes > UINT64_MAX ? UINT64_MAX : (uint64_t)depth_bytes;
 }
 
 static inline void
@@ -340,17 +331,7 @@ ueTokenIndexValid(int index) {
 }
 
 static inline void
-updateTokenbyIndexLocked(int index, uint64_t cur_cycles) {
-    shaper_update_bucket_tokens(&ue_table[index].ue_green_tb_params,
-                                cur_cycles);
-    shaper_update_bucket_tokens(&ue_table[index].ue_excess_tb_params,
-                                cur_cycles);
-    shaper_update_bucket_tokens(&ue_table[index].ue_yellow_cap_tb_params,
-                                cur_cycles);
-}
-
-static inline void
-initBucket(struct tb_config *tb, uint32_t rate, uint64_t now) {
+initBucket(struct tb_config *tb, uint64_t rate, uint64_t now) {
     tb->tb_rate = rate;
     tb->tb_depth = shaper_bucket_depth(rate);
     tb->tb_tokens = tb->tb_depth;
@@ -363,36 +344,15 @@ bucketCanFitPacket(const struct tb_config *tb, uint32_t pkt_len) {
     return tb->tb_depth > 0 && pkt_len <= tb->tb_depth;
 }
 
-uint64_t
-ueShaperQueueLimitBytes(int index, bool is_qos, uint32_t delay_ms, uint64_t min_bytes) {
-    uint64_t rate_kbps = 0;
-    uint64_t limit_bytes;
+static inline struct gbr_qer_tb *
+findGbrQerLocked(int index, uint32_t qer_id) {
+    for (int qer_idx = 0; qer_idx < SHAPER_MAX_GBR_QERS_PER_UE; qer_idx++) {
+        struct gbr_qer_tb *qer = &ue_table[index].gbr_qers[qer_idx];
 
-    if (unlikely(index < 0 || index >= MAX_UE))
-        return min_bytes;
-
-    rte_spinlock_lock(&ue_tb_locks[index]);
-    if (ueTokenIndexValid(index)) {
-        if (is_qos) {
-            if (ue_table[index].ue_mbr > 0)
-                rate_kbps = ue_table[index].ue_mbr;
-            else if (ue_table[index].ue_gbr > 0)
-                rate_kbps = ue_table[index].ue_gbr;
-            else
-                rate_kbps = ue_table[index].ue_ambr;
-        } else {
-            rate_kbps = ue_table[index].ue_excess_tb_params.tb_rate;
-            if (rate_kbps == 0)
-                rate_kbps = ue_table[index].ue_ambr;
-        }
+        if (qer->used && qer->qer_id == qer_id)
+            return qer;
     }
-    rte_spinlock_unlock(&ue_tb_locks[index]);
-
-    if (rate_kbps == 0 || delay_ms == 0)
-        return min_bytes;
-
-    limit_bytes = (rate_kbps * (uint64_t)delay_ms + 7) / 8;
-    return limit_bytes > min_bytes ? limit_bytes : min_bytes;
+    return NULL;
 }
 
 void
@@ -428,12 +388,14 @@ ConfigureQerFlows(const UPDK_PDR *pdr, bool is_uplink) {
     struct rte_meter_trtcm_params trtcm_params = app_trtcm_params;
     bool has_gbr = qer->flags.guaranteedBitrate;
 
-    uint32_t mbr = is_uplink ? qer->maximumBitrate.ul : qer->maximumBitrate.dl;
+    uint64_t mbr = is_uplink ? qer->maximumBitrate.ul :
+                               qer->maximumBitrate.dl;
     trtcm_params.pir = (uint64_t)mbr * 1000 / 8;
     trtcm_params.pbs = trtcm_bucket_depth(mbr);
 
     if (has_gbr) {
-        uint32_t gbr = is_uplink ? qer->guaranteedBitrate.ul : qer->guaranteedBitrate.dl;
+        uint64_t gbr = is_uplink ? qer->guaranteedBitrate.ul :
+                                   qer->guaranteedBitrate.dl;
         trtcm_params.cir = (uint64_t)gbr * 1000 / 8;
         trtcm_params.cbs = trtcm_bucket_depth(gbr);
     } else {
@@ -517,56 +479,168 @@ findIndexByUeIpAddress(uint32_t ue_ip) {
     return ueHashSearch(ue_ip);
 }
 
-int
-addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr, uint32_t ue_mbr) {
-    int added_idx = -1;
-    int existing_idx;
+bool
+refreshUeSessionAmbr(int index, uint64_t session_ambr,
+                     bool conflicting_rates) {
+    bool rate_changed;
+    bool new_conflict;
 
-    if (ue_ambr == 0) {
-        UTLT_Warning("Reject UE %u shaper config with zero AMBR", ue_ip);
-        return -1;
+    if (unlikely(index < 0 || index >= MAX_UE))
+        return false;
+
+    rte_spinlock_lock(&ue_tb_locks[index]);
+    if (unlikely(!ueTokenIndexValid(index))) {
+        rte_spinlock_unlock(&ue_tb_locks[index]);
+        return false;
     }
 
-    if (ue_gbr > ue_ambr)
-        ue_gbr = ue_ambr;
-    if (ue_mbr == 0 || ue_mbr > ue_ambr)
-        ue_mbr = ue_ambr;
-    if (ue_gbr > ue_mbr)
-        ue_gbr = ue_mbr;
+    rate_changed = ue_table[index].session_ambr != session_ambr;
+    new_conflict = conflicting_rates &&
+                   !ue_table[index].session_ambr_conflict;
+    if (rate_changed) {
+        uint64_t old_rate = ue_table[index].session_ambr;
+
+        ue_table[index].session_ambr = session_ambr;
+        initBucket(&ue_table[index].session_ambr_tb, session_ambr,
+                   rte_get_tsc_cycles());
+        UTLT_Warning("UE %u Session-AMBR changed from %" PRIu64
+                     " to %" PRIu64
+                     " Kbps; token state reset and a full burst is temporarily available",
+                     ue_table[index].ue_ip, old_rate, session_ambr);
+    }
+    if (new_conflict) {
+        UTLT_Warning("UE %u has conflicting Non-GBR QER DL rates; using largest Session-AMBR %"
+                     PRIu64 " Kbps", ue_table[index].ue_ip, session_ambr);
+    }
+    ue_table[index].session_ambr_conflict = conflicting_rates;
+    rte_spinlock_unlock(&ue_tb_locks[index]);
+    return true;
+}
+
+bool
+refreshUeGbrQer(int index, uint32_t qer_id, uint8_t qfi,
+                uint64_t gfbr, uint64_t mfbr) {
+    struct gbr_qer_tb *qer = NULL;
+    struct gbr_qer_tb *free_qer = NULL;
+    uint64_t now;
+
+    if (unlikely(index < 0 || index >= MAX_UE || qer_id == 0 ||
+                 gfbr == 0 || mfbr == 0))
+        return false;
+
+    rte_spinlock_lock(&ue_tb_locks[index]);
+    if (unlikely(!ueTokenIndexValid(index))) {
+        rte_spinlock_unlock(&ue_tb_locks[index]);
+        return false;
+    }
+
+    for (int qer_idx = 0; qer_idx < SHAPER_MAX_GBR_QERS_PER_UE; qer_idx++) {
+        struct gbr_qer_tb *candidate =
+            &ue_table[index].gbr_qers[qer_idx];
+
+        if (candidate->used && candidate->qer_id == qer_id) {
+            qer = candidate;
+            break;
+        }
+        if (!candidate->used && free_qer == NULL)
+            free_qer = candidate;
+    }
+
+    if (qer == NULL) {
+        if (free_qer == NULL) {
+            rte_spinlock_unlock(&ue_tb_locks[index]);
+            UTLT_Warning("UE %u GBR QER table full; cannot add QER %u",
+                         ue_table[index].ue_ip, qer_id);
+            return false;
+        }
+
+        qer = free_qer;
+        now = rte_get_tsc_cycles();
+        memset(qer, 0, sizeof(*qer));
+        qer->used = true;
+        qer->qer_id = qer_id;
+        qer->qfi = qfi;
+        qer->gfbr = gfbr;
+        qer->mfbr = mfbr;
+        initBucket(&qer->gfbr_tb, gfbr, now);
+        initBucket(&qer->mfbr_tb, mfbr, now);
+        UTLT_Info("UE %u GBR QER %u configured: QFI=%u GFBR=%" PRIu64
+                  " MFBR=%" PRIu64 " Kbps",
+                  ue_table[index].ue_ip, qer_id, qfi, gfbr, mfbr);
+        if (gfbr > mfbr) {
+            UTLT_Warning("UE %u GBR QER %u has GFBR %" PRIu64
+                         " above MFBR %" PRIu64
+                         " Kbps; MFBR remains the aggregate hard limit",
+                         ue_table[index].ue_ip, qer_id, gfbr, mfbr);
+        }
+        rte_spinlock_unlock(&ue_tb_locks[index]);
+        return true;
+    }
+
+    if (qer->qfi != qfi) {
+        UTLT_Warning("UE %u GBR QER %u changed QFI from %u to %u",
+                     ue_table[index].ue_ip, qer_id, qer->qfi, qfi);
+        qer->qfi = qfi;
+    }
+    if (qer->gfbr != gfbr || qer->mfbr != mfbr) {
+        uint64_t old_gfbr = qer->gfbr;
+        uint64_t old_mfbr = qer->mfbr;
+
+        now = rte_get_tsc_cycles();
+        qer->gfbr = gfbr;
+        qer->mfbr = mfbr;
+        initBucket(&qer->gfbr_tb, gfbr, now);
+        initBucket(&qer->mfbr_tb, mfbr, now);
+        UTLT_Warning("UE %u GBR QER %u changed GFBR/MFBR from %" PRIu64
+                     "/%" PRIu64 " to %" PRIu64 "/%" PRIu64
+                     " Kbps; token state reset and a full burst is temporarily available",
+                     ue_table[index].ue_ip, qer_id, old_gfbr, old_mfbr,
+                     gfbr, mfbr);
+        if (gfbr > mfbr) {
+            UTLT_Warning("UE %u GBR QER %u has GFBR %" PRIu64
+                         " above MFBR %" PRIu64
+                         " Kbps; MFBR remains the aggregate hard limit",
+                         ue_table[index].ue_ip, qer_id, gfbr, mfbr);
+        }
+    }
+
+    rte_spinlock_unlock(&ue_tb_locks[index]);
+    return true;
+}
+
+int
+addEntrybyUeIp(uint32_t ue_ip, uint64_t session_ambr,
+               bool conflicting_rates) {
+    int added_idx = -1;
+    int existing_idx;
 
     rte_spinlock_lock(&ue_table_lock);
     existing_idx = ueHashSearch(ue_ip);
     if (existing_idx >= 0) {
         rte_spinlock_unlock(&ue_table_lock);
+        refreshUeSessionAmbr(existing_idx, session_ambr,
+                            conflicting_rates);
         return existing_idx;
     }
 
     for (int i = 0; i < MAX_UE; i++) {
         if (ue_table[i].ue_ip == 0) { // find unused
             uint64_t now = rte_get_tsc_cycles();
-            uint32_t green_rate = ue_gbr;
-            uint32_t excess_rate = ue_ambr > ue_gbr ?
-                                   ue_ambr - ue_gbr : 0;
-            uint32_t yellow_cap_rate = ue_mbr > ue_gbr ?
-                                       ue_mbr - ue_gbr : 0;
 
             rte_spinlock_lock(&ue_tb_locks[i]);
-            ue_table[i].ue_ambr = ue_ambr;
-            ue_table[i].ue_gbr = ue_gbr;
-            ue_table[i].ue_mbr = ue_mbr;
-
-            initBucket(&ue_table[i].ue_green_tb_params, green_rate, now);
-            initBucket(&ue_table[i].ue_excess_tb_params, excess_rate, now);
-            initBucket(&ue_table[i].ue_yellow_cap_tb_params,
-                       yellow_cap_rate, now);
-
-            UTLT_Info("Green GFBR Rate: %u", green_rate);
-            UTLT_Info("Shared Excess Rate: %u", excess_rate);
-            UTLT_Info("Yellow Cap Rate: %u", yellow_cap_rate);
-
+            memset(&ue_table[i], 0, sizeof(ue_table[i]));
+            ue_table[i].session_ambr = session_ambr;
+            ue_table[i].session_ambr_conflict = conflicting_rates;
+            initBucket(&ue_table[i].session_ambr_tb, session_ambr, now);
             ue_table[i].ue_ip = ue_ip;
             rte_spinlock_unlock(&ue_tb_locks[i]);
             if (ueHashInsert(ue_ip, i)) {
+                UTLT_Info("UE %u Session-AMBR configured: %" PRIu64
+                          " Kbps", ue_ip, session_ambr);
+                if (conflicting_rates) {
+                    UTLT_Warning("UE %u has conflicting Non-GBR QER DL rates; using largest Session-AMBR %"
+                                 PRIu64 " Kbps", ue_ip, session_ambr);
+                }
                 added_idx = i;
             } else {
                 rte_spinlock_lock(&ue_tb_locks[i]);
@@ -581,28 +655,40 @@ addEntrybyUeIp(uint32_t ue_ip, uint32_t ue_ambr, uint32_t ue_gbr, uint32_t ue_mb
     return added_idx;  // Return the allocated index, or -1 if table full
 }
 
-void
-updateTokenbyIndex(int index) {
-    uint64_t cur_cycles;
+bool
+removeEntrybyUeIp(uint32_t ue_ip) {
+    int removed_idx;
 
-    if (unlikely(index < 0 || index >= MAX_UE)) {
-        UTLT_Error("UE IP not found in the table");
-        return;
+    rte_spinlock_lock(&ue_table_lock);
+    removed_idx = ueHashSearch(ue_ip);
+    if (removed_idx < 0) {
+        rte_spinlock_unlock(&ue_table_lock);
+        return false;
     }
 
-    rte_spinlock_lock(&ue_tb_locks[index]);
-    if (ueTokenIndexValid(index)) {
-        cur_cycles = rte_get_tsc_cycles();
-        updateTokenbyIndexLocked(index, cur_cycles);
-        rte_spinlock_unlock(&ue_tb_locks[index]);
-        return;
+    rte_spinlock_lock(&ue_tb_locks[removed_idx]);
+    memset(&ue_table[removed_idx], 0, sizeof(ue_table[removed_idx]));
+    rte_spinlock_unlock(&ue_tb_locks[removed_idx]);
+
+    /* Linear-probing lookups cannot simply clear one occupied hash slot: it
+     * could make entries later in that probe chain unreachable. Session
+     * deletion is rare, so rebuild the small fixed hash table in place. */
+    for (int hash_idx = 0; hash_idx < MAX_UE; hash_idx++)
+        ueHashSetInUse(hash_idx, false);
+    for (int ue_idx = 0; ue_idx < MAX_UE; ue_idx++) {
+        if (ue_table[ue_idx].ue_ip != 0 &&
+            !ueHashInsert(ue_table[ue_idx].ue_ip, ue_idx)) {
+            UTLT_Error("Failed to rebuild UE shaper hash for UE %u",
+                       ue_table[ue_idx].ue_ip);
+        }
     }
-    rte_spinlock_unlock(&ue_tb_locks[index]);
-    UTLT_Error("UE IP not found in the table");
+
+    rte_spinlock_unlock(&ue_table_lock);
+    return true;
 }
 
 bool
-ueBucketCanFitPacket(int index, enum ue_bucket_class bucket_class, uint32_t pkt_len) {
+sessionAmbrCanFitPacket(int index, uint32_t pkt_len) {
     bool can_fit;
 
     if (unlikely(index < 0 || index >= MAX_UE))
@@ -614,34 +700,61 @@ ueBucketCanFitPacket(int index, enum ue_bucket_class bucket_class, uint32_t pkt_
         return false;
     }
 
-    switch (bucket_class) {
-    case UE_BUCKET_GREEN:
-        can_fit = bucketCanFitPacket(&ue_table[index].ue_green_tb_params,
-                                     pkt_len);
-        break;
-    case UE_BUCKET_YELLOW:
-        can_fit = bucketCanFitPacket(&ue_table[index].ue_excess_tb_params,
-                                     pkt_len) &&
-                  bucketCanFitPacket(&ue_table[index].ue_yellow_cap_tb_params,
-                                     pkt_len);
-        break;
-    case UE_BUCKET_NQOS:
-        can_fit = bucketCanFitPacket(&ue_table[index].ue_excess_tb_params,
-                                     pkt_len);
-        break;
-    default:
-        can_fit = false;
-        break;
-    }
+    can_fit = bucketCanFitPacket(&ue_table[index].session_ambr_tb,
+                                 pkt_len);
     rte_spinlock_unlock(&ue_tb_locks[index]);
     return can_fit;
 }
 
 bool
-consumeUeBucketTokens(int index, enum ue_bucket_class bucket_class, uint32_t pkt_len) {
-    struct tb_config *green_tb;
-    struct tb_config *excess_tb;
-    struct tb_config *yellow_cap_tb;
+gbrGuaranteedCanFitPacket(int index, uint32_t qer_id, uint32_t pkt_len) {
+    struct gbr_qer_tb *qer;
+    bool can_fit = false;
+
+    if (unlikely(index < 0 || index >= MAX_UE))
+        return false;
+
+    rte_spinlock_lock(&ue_tb_locks[index]);
+    if (unlikely(!ueTokenIndexValid(index))) {
+        rte_spinlock_unlock(&ue_tb_locks[index]);
+        return false;
+    }
+
+    qer = findGbrQerLocked(index, qer_id);
+    if (qer != NULL) {
+        can_fit = bucketCanFitPacket(&qer->gfbr_tb, pkt_len) &&
+                  bucketCanFitPacket(&qer->mfbr_tb, pkt_len);
+    }
+
+    rte_spinlock_unlock(&ue_tb_locks[index]);
+    return can_fit;
+}
+
+bool
+gbrExcessCanFitPacket(int index, uint32_t qer_id, uint32_t pkt_len) {
+    struct gbr_qer_tb *qer;
+    bool can_fit = false;
+
+    if (unlikely(index < 0 || index >= MAX_UE))
+        return false;
+
+    rte_spinlock_lock(&ue_tb_locks[index]);
+    if (unlikely(!ueTokenIndexValid(index))) {
+        rte_spinlock_unlock(&ue_tb_locks[index]);
+        return false;
+    }
+
+    qer = findGbrQerLocked(index, qer_id);
+    if (qer != NULL)
+        can_fit = bucketCanFitPacket(&qer->mfbr_tb, pkt_len);
+
+    rte_spinlock_unlock(&ue_tb_locks[index]);
+    return can_fit;
+}
+
+bool
+consume_session_ambr(int index, uint32_t pkt_len) {
+    struct tb_config *session_tb;
     bool consumed = false;
 
     if (unlikely(index < 0 || index >= MAX_UE))
@@ -653,42 +766,70 @@ consumeUeBucketTokens(int index, enum ue_bucket_class bucket_class, uint32_t pkt
         return false;
     }
 
-    updateTokenbyIndexLocked(index, rte_get_tsc_cycles());
+    session_tb = &ue_table[index].session_ambr_tb;
+    shaper_update_bucket_tokens(session_tb, rte_get_tsc_cycles());
+    if (session_tb->tb_tokens >= pkt_len) {
+        session_tb->tb_tokens -= pkt_len;
+        consumed = true;
+    }
 
-    green_tb = &ue_table[index].ue_green_tb_params;
-    excess_tb = &ue_table[index].ue_excess_tb_params;
-    yellow_cap_tb = &ue_table[index].ue_yellow_cap_tb_params;
+    rte_spinlock_unlock(&ue_tb_locks[index]);
+    return consumed;
+}
 
-    switch (bucket_class) {
-    case UE_BUCKET_GREEN:
-        /* Preserve FIFO order by letting green head packets use QoS excess
-         * when GFBR tokens are temporarily unavailable. */
-        if (green_tb->tb_tokens >= pkt_len) {
-            green_tb->tb_tokens -= pkt_len;
-            consumed = true;
-        } else if (excess_tb->tb_tokens >= pkt_len &&
-                   yellow_cap_tb->tb_tokens >= pkt_len) {
-            excess_tb->tb_tokens -= pkt_len;
-            yellow_cap_tb->tb_tokens -= pkt_len;
+bool
+consume_gbr_guaranteed(int index, uint32_t qer_id, uint32_t pkt_len) {
+    struct gbr_qer_tb *qer;
+    bool consumed = false;
+
+    if (unlikely(index < 0 || index >= MAX_UE))
+        return false;
+
+    rte_spinlock_lock(&ue_tb_locks[index]);
+    if (unlikely(!ueTokenIndexValid(index))) {
+        rte_spinlock_unlock(&ue_tb_locks[index]);
+        return false;
+    }
+
+    qer = findGbrQerLocked(index, qer_id);
+    if (qer != NULL) {
+        uint64_t now = rte_get_tsc_cycles();
+
+        shaper_update_bucket_tokens(&qer->gfbr_tb, now);
+        shaper_update_bucket_tokens(&qer->mfbr_tb, now);
+        if (qer->gfbr_tb.tb_tokens >= pkt_len &&
+            qer->mfbr_tb.tb_tokens >= pkt_len) {
+            qer->gfbr_tb.tb_tokens -= pkt_len;
+            qer->mfbr_tb.tb_tokens -= pkt_len;
             consumed = true;
         }
-        break;
-    case UE_BUCKET_YELLOW:
-        if (excess_tb->tb_tokens >= pkt_len &&
-            yellow_cap_tb->tb_tokens >= pkt_len) {
-            excess_tb->tb_tokens -= pkt_len;
-            yellow_cap_tb->tb_tokens -= pkt_len;
+    }
+
+    rte_spinlock_unlock(&ue_tb_locks[index]);
+    return consumed;
+}
+
+bool
+consume_gbr_excess(int index, uint32_t qer_id, uint32_t pkt_len) {
+    struct gbr_qer_tb *qer;
+    bool consumed = false;
+
+    if (unlikely(index < 0 || index >= MAX_UE))
+        return false;
+
+    rte_spinlock_lock(&ue_tb_locks[index]);
+    if (unlikely(!ueTokenIndexValid(index))) {
+        rte_spinlock_unlock(&ue_tb_locks[index]);
+        return false;
+    }
+
+    qer = findGbrQerLocked(index, qer_id);
+    if (qer != NULL) {
+        shaper_update_bucket_tokens(&qer->mfbr_tb, rte_get_tsc_cycles());
+        if (qer->mfbr_tb.tb_tokens >= pkt_len) {
+            qer->mfbr_tb.tb_tokens -= pkt_len;
             consumed = true;
         }
-        break;
-    case UE_BUCKET_NQOS:
-        if (excess_tb->tb_tokens >= pkt_len) {
-            excess_tb->tb_tokens -= pkt_len;
-            consumed = true;
-        }
-        break;
-    default:
-        break;
     }
 
     rte_spinlock_unlock(&ue_tb_locks[index]);

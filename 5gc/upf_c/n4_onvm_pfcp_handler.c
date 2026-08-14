@@ -2031,20 +2031,43 @@ Status UpfN4HandleSessionDeletionRequest(UpfSession *session, PfcpXact *xact,
     Status status;
     PfcpHeader header;
     Bufblk *bufBlk = NULL;
+    uint64_t smf_seid = session->smfSeid;
+    uint32_t shaper_ue_ip = rte_be_to_cpu_32(session->ueIpv4.addr4.s_addr);
+    uint16_t worker_service_id = session->worker_service_id;
+    bool shaper_remove_notified = false;
+
+    /* Build the response while the session object is still valid. */
+    memset(&header, 0, sizeof(header));
+    header.type = PFCP_SESSION_DELETION_RESPONSE;
+    header.seid = smf_seid;
+
+    status = UpfN4BuildSessionDeletionResponse(&bufBlk, header.type,
+                                               session, request);
+    UTLT_Assert(status == STATUS_OK, return STATUS_ERROR, "N4 build error");
 
     /* delete session */
     UTLT_Assert(UpfSessionRemove(session) == STATUS_OK, return STATUS_ERROR,
         "UpfSessionRemove failed");
 
-    /* Send Session Deletion Response */
-    memset(&header, 0, sizeof(PfcpHeader));
-
-    header.type = PFCP_SESSION_DELETION_RESPONSE;
-    header.seid = session->smfSeid;
-
-    status = UpfN4BuildSessionDeletionResponse(&bufBlk, header.type,
-                                               session, request);
-    UTLT_Assert(status == STATUS_OK, return STATUS_ERROR, "N4 build error");
+    /* The owning worker holds all queued packets and token state for this
+     * one-UE/one-session deployment. Flush it after the shared session maps
+     * have been removed so no new packet can legitimately join the session. */
+    if (worker_service_id != UPF_INVALID_SERVICE_ID) {
+        if (UpfSendEvt1(worker_service_id,
+                        UPF_EVENT_SHAPER_SESSION_REMOVE,
+                        (uintptr_t)shaper_ue_ip) != 0) {
+            UTLT_Warning("Failed to notify worker %u to remove UE %u shaper state",
+                         worker_service_id, shaper_ue_ip);
+        } else {
+            shaper_remove_notified = true;
+        }
+    }
+    if (!shaper_remove_notified &&
+        UpfBroadcastEvt1ToWorkers(UPF_EVENT_SHAPER_SESSION_REMOVE,
+                                  (uintptr_t)shaper_ue_ip) == 0) {
+        UTLT_Warning("No worker available to remove UE %u shaper state",
+                     shaper_ue_ip);
+    }
 
     status = PfcpXactUpdateTx(xact, &header, bufBlk);
     UTLT_Assert(status == STATUS_OK, return STATUS_ERROR,
